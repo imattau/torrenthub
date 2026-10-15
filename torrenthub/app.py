@@ -24,7 +24,7 @@ from .gaplog import GapLog
 from .mirror import Inflight, Mirror
 from .policy import check_file, load_policy
 from .publish import Ingest, PublishError
-from .store import Store
+from .store import Store, valid_key
 from .swarm import Swarm, make_swarm
 from .torrent import magnet
 from .upstream import HubError, Upstream, UpstreamSet, make_upstream
@@ -93,6 +93,15 @@ def parse_tree(raw: str) -> tuple[str, str, str]:
 
 
 # --------------------------------------------------------------------- responses
+
+def content_disposition(name: str) -> str:
+    """A header value that is plain ASCII whatever the file is called: a fallback name with every
+    character outside printable ASCII, and every quote or backslash, replaced, and the real name
+    after it in the RFC 5987 form that browsers and download tools understand."""
+    base = name.rsplit("/", 1)[-1]
+    fallback = "".join(c if 0x20 <= ord(c) < 0x7F and c not in '"\\%' else "_" for c in base) or "file"
+    return f"inline; filename=\"{fallback}\"; filename*=UTF-8\'\'{quote(base, safe='')}"
+
 
 def _range_headers(base_headers: dict, rng: tuple[int, int] | None, size: int) -> tuple[dict, int, int, int, int]:
     headers = dict(base_headers)
@@ -280,6 +289,52 @@ class BodyLimit:
         await send({"type": "http.response.body", "body": body})
 
 
+class RateLimit:
+    """A token bucket per client address for the POST endpoints, checked before the body is read.
+
+    The address is the one the server reports for the connection. uvicorn takes it from the peer, or
+    from X-Forwarded-For when the peer is on the list in FORWARDED_ALLOW_IPS (default: loopback only,
+    which suits a reverse proxy on the same machine). Behind a proxy on another machine, set
+    FORWARDED_ALLOW_IPS to that proxy's address, or every client will share its bucket. Never list
+    addresses you do not control: a client of a listed address can claim to be anyone."""
+
+    def __init__(self, app, rules: dict[str, tuple[int, float]]):
+        self.app, self.rules = app, rules
+        self.buckets: dict[tuple[str, str], list[float]] = {}
+
+    @staticmethod
+    def _who(scope) -> str:
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    async def __call__(self, scope, receive, send):
+        rule = None
+        if scope["type"] == "http" and scope["method"] == "POST":
+            rule = next(((p, r) for p, r in self.rules.items() if scope["path"].startswith(p) and r[1] > 0), None)
+        if rule is None:
+            return await self.app(scope, receive, send)
+        prefix, (burst, per_minute) = rule
+        now = time.monotonic()
+        key = (prefix, self._who(scope))
+        tokens, last = self.buckets.get(key, [float(burst), now])
+        tokens = min(float(burst), tokens + (now - last) * per_minute / 60.0)
+        if tokens < 1:
+            self.buckets[key] = [tokens, now]
+            wait = max(1, int((1 - tokens) * 60.0 / per_minute) + 1)
+            body = json.dumps({"error": f"too many requests from this address; try again in {wait}s"}).encode()
+            return await send_response(send, 429, body, {b"retry-after": str(wait).encode(), b"x-error-code": b"RateLimited"})
+        self.buckets[key] = [tokens - 1, now]
+        if len(self.buckets) > 50_000:  # forget addresses that have recovered
+            self.buckets = {k: v for k, v in self.buckets.items() if v[0] < burst - 0.5}
+        await self.app(scope, receive, send)
+
+
+async def send_response(send, status: int, body: bytes, extra: dict | None = None):
+    headers = [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()), *(extra or {}).items()]
+    await send({"type": "http.response.start", "status": status, "headers": headers})
+    await send({"type": "http.response.body", "body": body})
+
+
 # --------------------------------------------------------------------- app
 
 def create_app(
@@ -312,7 +367,19 @@ def create_app(
         for b in store.seedable():
             if store.blob_complete(b.key):
                 await swarm.seed(store.torrent_path(b.key), store.blob_path(b.key).parent)
+
+        async def janitor():
+            """Quarantined events are meant to last a day; nothing else removes them."""
+            while True:
+                try:
+                    admission.purge()
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(600)
+
+        sweeper = asyncio.create_task(janitor())
         yield
+        sweeper.cancel()
         await ingest.aclose()
         await mirror.aclose()
         await swarm.close()
@@ -320,6 +387,10 @@ def create_app(
 
     app = FastAPI(title="torrenthub", lifespan=lifespan)
     app.add_middleware(BodyLimit, limits={"/api/thub/events": settings.max_event_body, "/api/thub/publish": settings.publish_max_body})
+    # added last, so it runs first: a flooding address is turned away before anything else looks at the request
+    app.add_middleware(RateLimit, rules={
+        "/api/thub/events": (settings.events_per_ip_burst, settings.events_per_ip_per_minute),
+        "/api/thub/publish": (10, settings.publish_per_ip_per_minute)})
     app.state.mirror = mirror
     app.state.ingest = ingest
     app.state.store = store
@@ -598,15 +669,15 @@ def create_app(
 
     @app.get("/torrents/{key}.torrent")
     async def torrent_file(key: str):
-        p = store.torrent_path(key)
-        if "/" in key or store.is_blocked(key) or not p.exists():
+        if not valid_key(key) or store.is_blocked(key) or not store.torrent_path(key).exists():
             raise HubError(404, "EntryNotFound", "no such torrent")
+        p = store.torrent_path(key)
         return FileResponse(p, media_type="application/x-bittorrent")
 
     @app.api_route("/blobs/{key}", methods=["GET", "HEAD"])
     async def blob(key: str, request: Request):
         """Web seed endpoint (BEP-19). Serves only blobs we already hold."""
-        if "/" in key or store.is_blocked(key) or not store.blob_complete(key):
+        if not valid_key(key) or store.is_blocked(key) or not store.blob_complete(key):
             raise HubError(404, "EntryNotFound", "blob not held here")
         b = store.get_blob(key)
         store.touch_blob(key)
@@ -636,7 +707,7 @@ def create_app(
         headers = {
             "X-Repo-Commit": commit,
             "ETag": f'"{rec.etag}"',
-            "Content-Disposition": f'inline; filename="{Path(filename).name}"',
+            "Content-Disposition": content_disposition(filename),
         }
         if dec.notes:
             headers["X-Thub-Warning"] = "; ".join(dec.notes)[:500]

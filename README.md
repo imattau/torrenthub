@@ -152,6 +152,8 @@ Gateway endpoints beyond the HF API: `/metrics` (Prometheus text), `/healthz`, `
 | `THUB_TRUST_HOPS` | `3` | Longest chain of endorsements followed from a root |
 | `THUB_POLICY` | none | TOML file of rules for what must be attested before a file is served. See `PROTOCOL.md` section 13 |
 | policy `max_age` / `[freshness]` | none | `max_age = "30d"` on a `[[file]]` rule counts only attestations that recent. `[freshness] manifest_max_age` is the same as `THUB_MANIFEST_MAX_AGE` |
+| `THUB_EVENTS_PER_IP_BURST` / `_MINUTE`, `THUB_PUBLISH_PER_IP_MINUTE` | `300` / `600`, `30` | Requests an address may send to the event and publish endpoints; 0 turns a limit off. Behind a proxy on another machine, set uvicorn's `FORWARDED_ALLOW_IPS` to its address |
+| `THUB_MAX_EVENT_BODY`, `THUB_PUBLISH_MAX_BODY` | `256K`, `64M` | Largest request body read for each POST endpoint |
 | `THUB_PUBLISH_QUOTA` | `0` | Bytes of published content one signing key may hold here, such as `10G`. 0 turns publishing off. Only roots and their `publish:<repo>` delegates may publish |
 | `THUB_PUBLISH_STALL` / `THUB_PUBLISH_TIMEOUT` | `120` / `3600` | Seconds a publisher may send nothing, and the longest a publication may take |
 | `THUB_MANIFEST_MAX_AGE` | none | Seconds. Refuse to resolve a branch name through a signed manifest older than this |

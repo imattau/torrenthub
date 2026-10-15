@@ -393,7 +393,9 @@ def run_event_command(args, settings, p) -> None:
 
                 for ev in evs:
                     if post:
-                        r = httpx.post(post.rstrip("/") + "/api/thub/events", json=ev, timeout=30)
+                        from .sync import post_event
+
+                        r = post_event(post.rstrip("/") + "/api/thub/events", ev)
                         st = r.json().get("status", f"http{r.status_code}") if r.headers.get("content-type", "").startswith("application/json") else f"http{r.status_code}"
                     else:
                         st = Adm(EventStore(settings.data_dir), settings.roots).admit(ev).status

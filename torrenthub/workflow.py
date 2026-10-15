@@ -30,7 +30,7 @@ from . import events as E
 from .admission import Admission
 from .eventstore import EventStore
 from .signing import public_key
-from .sync import sync
+from .sync import post_event, sync
 from .trust import Graph, RequestStatus
 from .verifier import attest_file_events, scan_file
 
@@ -62,7 +62,7 @@ class Participant:
     def post(self, ev: dict) -> str:
         """Send an event to the hub. Returns its answer: accepted, quarantined (the hub does not
         know this key), duplicate, or rejected."""
-        r = httpx.post(self.hub + "/api/thub/events", json=ev, timeout=30)
+        r = post_event(self.hub + "/api/thub/events", ev)
         try:
             st = r.json().get("status", f"http{r.status_code}")
         except ValueError:

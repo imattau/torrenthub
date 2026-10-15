@@ -139,6 +139,10 @@ class Settings:
     publish_max_jobs_per_key: int = 2
     # Largest request body, in bytes, read for each POST endpoint. An event is capped at 64 KiB by its parser.
     max_event_body: int = 256 * 1024
+    # Requests per client address for the POST endpoints: a burst, then this many a minute. 0 turns it off.
+    events_per_ip_burst: int = 300
+    events_per_ip_per_minute: float = 600.0
+    publish_per_ip_per_minute: float = 30.0
     publish_max_body: int = 64 * 1024 * 1024
     # Keys this gateway pins as roots (hex or npub). Events from keys reachable from a root go in
     # the main event store with a large allowance. Everyone else is quarantined. See PROTOCOL.md.
@@ -200,6 +204,10 @@ class Settings:
             publish_quota=parse_size(e("THUB_PUBLISH_QUOTA"), 0),
             publish_stall=float(e("THUB_PUBLISH_STALL", "120")),
             max_event_body=parse_size(e("THUB_MAX_EVENT_BODY"), 256 * 1024),
+            events_per_ip_burst=int(e("THUB_EVENTS_PER_IP_BURST", "300")),
+            events_per_ip_per_minute=float(e("THUB_EVENTS_PER_IP_MINUTE", "600")),
+            publish_per_ip_per_minute=float(e("THUB_PUBLISH_PER_IP_MINUTE", "30")),
+
             publish_max_body=parse_size(e("THUB_PUBLISH_MAX_BODY"), 64 * 1024 * 1024),
             publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),
             roots=parse_keys(e("THUB_ROOTS")),

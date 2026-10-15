@@ -478,3 +478,33 @@ def test_a_publishers_torrent_cannot_make_the_hub_contact_anyone_and_the_stored_
     finally:
         h.stop()
         srv.close()
+
+
+def test_awkward_file_names_publish_and_download_without_breaking_the_headers(hub, tmp_path):
+    from urllib.parse import quote, unquote
+
+    names = {"模型 v2.json": b"{}\n", 'say "hi".txt': b"hi\n", "100% done.txt": b"d\n", "dir/é à.md": b"# e\n"}
+    pub, st = run(push(hub, tmp_path, {**names, "config.json": b"{}\n"}))
+    assert st["state"] == "done"
+    for name, data in names.items():
+        r = httpx.get(f"{hub.url}/{REPO}/resolve/main/{quote(name)}", timeout=30)
+        assert r.status_code == 200 and r.content == data, name
+        cd = r.headers["content-disposition"]
+        cd.encode("ascii")
+        assert unquote(cd.split("filename*=UTF-8''")[1]) == name.rsplit("/", 1)[-1]
+    local = snapshot_download(REPO, endpoint=hub.url, cache_dir=str(tmp_path / "dl"), token=False)
+    for name, data in names.items():
+        assert open(f"{local}/{name}", "rb").read() == data
+
+
+def test_a_file_name_with_a_control_character_cannot_be_published(hub, tmp_path):
+    import base64
+    from torrenthub.federation import fingerprint
+
+    x = hashlib.sha256(b"x").hexdigest()
+    for bad in ("a\nb.txt", "a\x00b", "tab\there"):
+        info = {"sha": "0" * 40, "siblings": [{"rfilename": bad, "size": 1, "lfs": {"size": 1, "sha256": x}}]}
+        info["sha"] = content_commit(fingerprint(info))
+        body = {"manifest": build_manifest(SK, REPO, info, ["main"], seq=1), "inline": {x: base64.b64encode(b"x").decode()}, "torrents": {}}
+        r = post(hub, body)
+        assert r.status_code == 400 and "unsafe path" in r.json()["error"], (bad, r.text)

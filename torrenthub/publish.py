@@ -24,6 +24,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -75,9 +76,16 @@ def _b64(s, what: str) -> bytes:
         raise PublishError(400, "BadRequest", f"{what} is not valid base64") from e
 
 
+REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+
+
 def safe_path(p) -> bool:
-    return (isinstance(p, str) and 0 < len(p) <= MAX_PATH_LEN and "\0" not in p and not p.startswith("/")
-            and "\\" not in p and all(part not in ("", ".", "..") for part in p.split("/")))
+    """A file path inside a repo: forward slashes, no empty, "." or ".." parts, no backslash and no
+    control characters. Any other character, in any script, is fine."""
+    return (isinstance(p, str) and 0 < len(p) <= MAX_PATH_LEN and not p.startswith("/")
+            and "\\" not in p and all(part not in ("", ".", "..") for part in p.split("/"))
+            and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in p))
 
 
 def info_from_rows(repo: str, commit: str, rows) -> dict:
@@ -104,7 +112,7 @@ class Ingest:
         if not isinstance(ev, dict):
             raise PublishError(400, "BadRequest", "manifest is missing")
         repo = next((t[1] for t in ev.get("tags", []) if isinstance(t, list) and len(t) >= 2 and t[0] == "repo"), None)
-        if not isinstance(repo, str) or not 3 <= len(repo) <= 200 or repo.count("/") != 1 or not safe_path(repo):
+        if not isinstance(repo, str) or not REPO_NAME.fullmatch(repo):
             raise PublishError(400, "BadManifest", "the manifest names no valid repo")
         table = _b64(body["table"], "table") if body.get("table") else None
         try:
@@ -132,7 +140,7 @@ class Ingest:
             path, size, x, blob_id = r
             if not safe_path(path):
                 raise PublishError(400, "BadManifest", f"unsafe path {path!r}")
-            if not isinstance(size, int) or isinstance(size, bool) or size < 0 or not isinstance(x, str) or len(x) != 64 or blob_id is not None:
+            if not isinstance(size, int) or isinstance(size, bool) or size < 0 or not isinstance(x, str) or not SHA256_HEX.fullmatch(x) or blob_id is not None:
                 raise PublishError(400, "BadManifest", f"{path}: a published file needs a size and a sha256 and no git blob id")
         if m.commit != content_commit(rows):
             raise PublishError(400, "BadManifest", "the commit is not the name of this file table")

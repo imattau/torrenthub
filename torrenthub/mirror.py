@@ -51,18 +51,56 @@ from .upstream import STREAM_CHUNK, HubError, Upstream, UpstreamSet, UpstreamUna
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
 
+# owner/name, or a bare name for the old canonical repos, in the characters Hugging Face allows
+REPO_ID = re.compile(r"(?:[A-Za-z0-9][A-Za-z0-9._-]{0,95}/)?[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+SHA256_HEX = re.compile(r"[0-9a-f]{64}")
+GIT_BLOB_ID = re.compile(r"[0-9a-f]{40}")
+
+
+def _bad_metadata(why: str) -> HubError:
+    return HubError(502, "BadMetadata", f"the upstream sent file metadata that cannot be trusted: {why}")
+
+
+def safe_file_name(name) -> bool:
+    """A file name from a repo's table: forward slashes between parts, no parts that step up or stay
+    put, no control characters. Spaces, quotes and any script are fine."""
+    return (isinstance(name, str) and 0 < len(name) <= 1024 and not name.startswith("/")
+            and all(part not in ("", ".", "..") for part in name.split("/"))
+            and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in name))
+
+
 def files_from_info(info: dict) -> list[FileRec]:
-    """Turn an upstream model-info document (fetched with blobs=true) into file records."""
+    """Turn an upstream model-info document (fetched with blobs=true) into file records. The
+    document comes from another hub, so every field that becomes a file name or a path is checked
+    here: a hash that is not hex could otherwise point a download outside the data directory."""
     out = []
     for s in info.get("siblings", []):
+        if not isinstance(s, dict):
+            raise _bad_metadata("a file entry is not an object")
+        name = s.get("rfilename")
+        if not safe_file_name(name):
+            raise _bad_metadata(f"unusable file name {str(name)[:60]!r}")
         lfs = s.get("lfs")
-        if lfs:
-            out.append(FileRec(s["rfilename"], int(lfs["size"]), lfs["sha256"], lfs["sha256"], True))
-        else:
-            blob_id = s.get("blobId")
-            if not blob_id:
-                raise HubError(502, "UpstreamUnavailable", f"no blobId for {s['rfilename']}")
-            out.append(FileRec(s["rfilename"], int(s["size"]), blob_id, f"git-{blob_id}", False))
+        try:
+            if lfs:
+                size, sha = int(lfs["size"]), lfs["sha256"]
+                if not isinstance(sha, str) or not SHA256_HEX.fullmatch(sha):
+                    raise _bad_metadata(f"{name}: the sha256 is not 64 hex digits")
+                if size < 0:
+                    raise _bad_metadata(f"{name}: negative size")
+                out.append(FileRec(name, size, sha, sha, True))
+            else:
+                blob_id = s.get("blobId")
+                if not blob_id:
+                    raise HubError(502, "UpstreamUnavailable", f"no blobId for {name}")
+                if not isinstance(blob_id, str) or not GIT_BLOB_ID.fullmatch(blob_id):
+                    raise _bad_metadata(f"{name}: the blob id is not 40 hex digits")
+                size = int(s["size"])
+                if size < 0:
+                    raise _bad_metadata(f"{name}: negative size")
+                out.append(FileRec(name, size, blob_id, f"git-{blob_id}", False))
+        except (KeyError, TypeError, ValueError) as e:
+            raise _bad_metadata(f"{name}: {type(e).__name__}") from e
     return out
 
 
@@ -187,6 +225,8 @@ class Mirror:
     # ------------------------------------------------------------ policy
 
     def check_repo(self, repo_id: str) -> None:
+        if not REPO_ID.fullmatch(repo_id or ""):
+            raise HubError(404, "RepoNotFound", "not a repo name")
         if any(fnmatch.fnmatchcase(repo_id, p) for p in self.s.deny):
             raise HubError(451, "RepoBlocked", f"{repo_id} is blocked on this mirror")
         if not any(fnmatch.fnmatchcase(repo_id, p) for p in self.s.allow):
@@ -201,7 +241,9 @@ class Mirror:
         else:
             info = await self.upstream.model_info(repo_id, revision)
             source = "anchor" if getattr(self.upstream, "is_anchor", False) else "upstream"
-        sha = info["sha"]
+        sha = info.get("sha")
+        if not isinstance(sha, str) or not SHA40.fullmatch(sha):
+            raise _bad_metadata("the commit id is not 40 hex digits")
         if self.lock is not None:
             try:
                 # A table that no anchor vouched for is pinned on first sight.

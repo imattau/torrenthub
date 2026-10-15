@@ -21,6 +21,21 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+# What a blob key can be: the sha256 of an LFS file, or "git-" and the 40 hex digits of a git blob id.
+# Keys come from other hubs' metadata and are used to build file names, so nothing else is allowed.
+KEY_RE = re.compile(r"(?:[0-9a-f]{64}|git-[0-9a-f]{40})")
+
+
+def valid_key(key: str) -> bool:
+    return isinstance(key, str) and KEY_RE.fullmatch(key) is not None
+
+
+def _checked(key: str) -> str:
+    if not valid_key(key):
+        raise ValueError(f"unusable blob key {key!r}")
+    return key
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS refs (
   repo_id TEXT NOT NULL, ref TEXT NOT NULL, commit_sha TEXT NOT NULL, fetched_at REAL NOT NULL,
@@ -103,19 +118,20 @@ class Store:
 
     # paths
     def blob_path(self, key: str) -> Path:
+        _checked(key)
         p = self.root / "blobs" / key[:2]
         p.mkdir(parents=True, exist_ok=True)
         return p / key
 
     def torrent_path(self, key: str) -> Path:
-        return self.root / "torrents" / f"{key}.torrent"
+        return self.root / "torrents" / f"{_checked(key)}.torrent"
 
     def tmp_path(self, key: str) -> Path:
-        return self.root / "tmp" / f"{key}.part"
+        return self.root / "tmp" / f"{_checked(key)}.part"
 
     def swarm_torrent_path(self, key: str) -> Path:
         """Working copy of a torrent handed to the swarm engine, with web seeds removed."""
-        return self.root / "tmp" / f"{key}.swarm.torrent"
+        return self.root / "tmp" / f"{_checked(key)}.swarm.torrent"
 
     # refs and commits
     def get_ref(self, repo_id: str, ref: str) -> tuple[str, float] | None:

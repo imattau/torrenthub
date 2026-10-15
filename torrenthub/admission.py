@@ -29,6 +29,7 @@ class Limits:
     stranger_per_minute: float = 1.0
     stranger_stored: int = 20
     quarantine_ttl: int = 24 * 3600
+    quarantine_total: int = 100_000  # most quarantined events held at once, over all keys
     max_future_seconds: int = 600
 
 
@@ -60,6 +61,7 @@ class Admission:
         self.limits = limits or Limits()
         self.hops = hops
         self._buckets: dict[tuple[str, str], Bucket] = {}
+        self._qcount = (0.0, 0)  # (when counted, how many) for the quarantine cap
         self._graph: Graph | None = None
         self._graph_key = None
 
@@ -110,6 +112,8 @@ class Admission:
         else:
             if self.store.count(ev["pubkey"], "quarantine") >= lim.stranger_stored:
                 return Result("rejected", "quarantine allowance used", 429)
+            if self._quarantine_size(now) >= lim.quarantine_total:
+                return Result("rejected", "quarantine is full; try again later", 503)
         self.store.add(ev, tier, int(now))
         if tier == "main":
             self._promote_waiting(int(now))
@@ -138,6 +142,14 @@ class Admission:
                     for ev in self.store.quarantined_by(author):
                         self.store.promote(ev["id"])
                     moved = True
+
+    def _quarantine_size(self, now: float) -> int:
+        """How many events are quarantined, counted at most every ten seconds."""
+        when, n = self._qcount
+        if now - when > 10:
+            when, n = now, self.store.counts().get("quarantine", 0)
+        self._qcount = (when, n + 1)  # the caller is about to add one; keep the count current between recounts
+        return n
 
     def purge(self, now: float | None = None) -> int:
         now = time.time() if now is None else now

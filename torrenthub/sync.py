@@ -8,6 +8,8 @@ quarantined events stay where they are.
 
 from __future__ import annotations
 
+import time
+
 import httpx
 
 from .admission import Admission
@@ -15,6 +17,22 @@ from .eventstore import MAX_LIMIT, EventStore
 from .events import DELEGATION, ENDORSEMENT, KINDS
 
 MAX_EVENTS = 100_000  # most events looked at from one peer in one run
+
+
+def post_event(url: str, ev: dict, *, client: httpx.Client | None = None, tries: int = 6, timeout: float = 30.0) -> httpx.Response:
+    """POST one event, waiting out a 429 the way the server asks (Retry-After) up to `tries` times.
+    A hub rate limits by address and by key, and a client with many events must be able to wait."""
+    r = None
+    for _ in range(tries):
+        r = (client or httpx).post(url, json=ev, timeout=timeout)
+        if r.status_code != 429:
+            return r
+        try:
+            wait = float(r.headers.get("retry-after", 2))
+        except ValueError:
+            wait = 2.0
+        time.sleep(min(max(wait, 0.2), 30.0))
+    return r
 
 
 def _page_through(client: httpx.Client, base: str, kinds, limit: int = MAX_LIMIT):
@@ -66,7 +84,7 @@ def sync(adm: Admission, url: str, kinds=KINDS, *, pull: bool = True, push: bool
         if push:
             pending = [e for e in local if e["id"] not in remote_ids]
             for ev in pending:
-                r = client.post(base + "/api/thub/events", json=ev)
+                r = post_event(base + "/api/thub/events", ev, client=client)
                 try:
                     st = r.json().get("status", f"http{r.status_code}")
                 except ValueError:
