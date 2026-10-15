@@ -102,3 +102,17 @@ Run step 4's measure on it and watch:
 - the two machines' rough network setup (home or datacentre, behind NAT or not, which ports are open)
 
 I will not call anything proven until it has come back from a real run.
+
+## Results so far
+
+Run 2026-10-15/16 from one machine on a slow link (about 16 KB/s to 70 KB/s to huggingface.co).
+
+| Step | Result |
+|---|---|
+| 1. Probe | PASS (R1 to R5) on `prajjwal1/bert-tiny`, `hf-internal-testing/tiny-random-LlamaForCausalLM`, `sshleifer/tiny-gpt2`. All three are Xet backed: `resolve` answers 302 to a CDN host with `x-xet-hash`, `x-linked-etag` equal to the advertised `lfs.sha256`, and Range requests work (206). |
+| 2. Live gateway test | PASS on the same three repos, every file byte for byte. Needed two fixes first: 64 KiB upstream chunks and a 64 KiB holdback, because 1 MiB of each left slow-link clients without data for over 10s. |
+| 3. Two machines | Not run |
+| 4. Measure | Not run |
+| 5. Big model | Not run. Largest file tested: 17.7 MB |
+
+Not covered by the repos above: a recently created repo (the probe's own advice), gated repos, sharded weights, anything over 20 MB.
