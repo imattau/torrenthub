@@ -118,6 +118,26 @@ def test_file_smaller_than_holdback_is_fully_held_until_verified():
     asyncio.run(run())
 
 
+def test_default_holdback_is_small_and_first_byte_follows_it():
+    """A client waits for at most `holdback` bytes before the first byte, not for 1 MiB."""
+    from pathlib import Path
+
+    from torrenthub.config import Settings
+
+    hb = Settings(data_dir=Path("d")).stream_holdback
+    assert hb == 64 * 1024
+
+    async def run():
+        inf = _inflight(size=10 * hb, holdback=hb)
+        await inf.progress(hb)
+        with pytest.raises(asyncio.TimeoutError):  # exactly the holdback written: nothing yet
+            await asyncio.wait_for(inf.wait_for(0), timeout=0.2)
+        await inf.progress(hb + 1)
+        assert await asyncio.wait_for(inf.wait_for(0), timeout=0.2) == 1
+
+    asyncio.run(run())
+
+
 def test_concurrent_clients_share_one_upstream_download(gateway, upstream):
     upstream.app.state.delay = 0.03
     data = upstream.app.state.files["model.safetensors"]

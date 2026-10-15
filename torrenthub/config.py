@@ -147,7 +147,9 @@ class Settings:
     max_disk_bytes: int = 0
     # While streaming a first download to a client, never release the last N bytes until the
     # whole file has been verified. A client therefore never receives a complete corrupt file.
-    stream_holdback: int = 1024 * 1024
+    # Small on purpose: no byte is released until this many have been written, so it is also the
+    # silence a slow-link client sits through before its first byte.
+    stream_holdback: int = 64 * 1024
     # Repo policy: fnmatch globs on repo ids. Deny wins over allow.
     allow: list[str] = field(default_factory=lambda: ["*"])
     deny: list[str] = field(default_factory=list)
@@ -187,7 +189,7 @@ class Settings:
             swarm_timeout=float(e("THUB_SWARM_TIMEOUT", "300")),
             use_webseeds=_bool(e("THUB_USE_WEBSEEDS"), False),
             max_disk_bytes=parse_size(e("THUB_MAX_DISK")),
-            stream_holdback=parse_size(e("THUB_STREAM_HOLDBACK"), 1024 * 1024),
+            stream_holdback=parse_size(e("THUB_STREAM_HOLDBACK"), 64 * 1024),
             allow=_list(e("THUB_ALLOW"), ["*"]),
             deny=_list(e("THUB_DENY"), []),
             gap_warn=float(e("THUB_GAP_WARN", "5")),

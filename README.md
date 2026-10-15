@@ -157,7 +157,7 @@ Gateway endpoints beyond the HF API: `/metrics` (Prometheus text), `/healthz`, `
 | `THUB_SWARM_TIMEOUT` | `300` | Seconds without progress, once bytes were flowing, before the download fails |
 | `THUB_USE_WEBSEEDS` | `false` | Also pull from the torrent's web seeds. They are HTTP, so this sends bytes back through the hub |
 | `THUB_MAX_DISK` | `0` | Disk budget such as `500G`. 0 means unlimited. Only torrented blobs are evicted |
-| `THUB_STREAM_HOLDBACK` | `1M` | Bytes withheld from a streaming client until the file is verified |
+| `THUB_STREAM_HOLDBACK` | `64K` | Bytes withheld from a streaming client until the file is verified. Any size above zero keeps a corrupt file from completing; smaller means the first byte arrives sooner |
 | `THUB_ALLOW` | `*` | Comma separated globs of repo ids to mirror |
 | `THUB_DENY` | none | Comma separated globs to refuse with 451. Wins over allow |
 | `THUB_PREFETCH` | `false` | Fetch all files of a repo in the background after its metadata is read |
