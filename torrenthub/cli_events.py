@@ -1,0 +1,240 @@
+"""Command line for participant events: make them, add them here, pull them from a hub, ask about trust."""
+
+from __future__ import annotations
+
+import json
+import os
+import time
+from pathlib import Path
+
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "events-add", "events-pull", "events", "trust",
+                  "verify-blobs", "replicate", "signer", "verdict"}
+
+
+def _key_args(sp):
+    sp.add_argument("--key-file", help="file holding the secret key (hex or nsec). Otherwise THUB_SIGNING_KEY")
+    sp.add_argument("--out", help="write the event to this file instead of printing it")
+
+
+def add_event_commands(sub) -> None:
+    sp = sub.add_parser("identity", help="make an identity event for your key")
+    _key_args(sp)
+    sp.add_argument("--label", default="unspecified", choices=["human", "agent", "org", "unspecified"])
+    sp.add_argument("--recovery", help="public key (hex or npub) that may later replace this key")
+    sp.add_argument("--note", default="")
+
+    sp = sub.add_parser("delegate", help="let another key act for you (a statement of authority, not an opinion)")
+    _key_args(sp)
+    sp.add_argument("--subject", required=True, help="public key to authorise")
+    sp.add_argument("--scope", action="append", required=True, help="e.g. publish:acme/*, repeatable")
+    sp.add_argument("--expires-in", type=int, help="seconds from now")
+    sp.add_argument("--redelegable", action="store_true", help="the subject may delegate onward")
+    sp.add_argument("--max-events-per-day", type=int)
+    sp.add_argument("--max-bytes-per-day", type=int)
+
+    sp = sub.add_parser("endorse", help="say you trust a key for some scopes (an opinion, weighed)")
+    _key_args(sp)
+    sp.add_argument("--subject", required=True)
+    sp.add_argument("--scope", action="append", required=True)
+    sp.add_argument("--weight", type=float, required=True, help="above 0, up to 1")
+    sp.add_argument("--delegable", action="store_true", help="the subject's own endorsements count onward")
+    sp.add_argument("--expires-in", type=int)
+
+    sp = sub.add_parser("revoke", help="revoke an event, a key or a blob")
+    _key_args(sp)
+    sp.add_argument("--kind", required=True, choices=["event", "key", "x"])
+    sp.add_argument("--target", required=True, help="event id, public key (hex or npub), or sha256")
+    sp.add_argument("--reason", default="")
+    sp.add_argument("--taint", action="store_true", help="things derived from a revoked blob are affected too")
+
+    sp = sub.add_parser("events-add", help="check an event file and add it to this gateway's event store")
+    sp.add_argument("file")
+
+    sp = sub.add_parser("events-pull", help="fetch events from another gateway and add the ones that pass")
+    sp.add_argument("url")
+    sp.add_argument("--kinds", default="36778,36779,36780,36781")
+    sp.add_argument("--author", action="append")
+    sp.add_argument("--since", type=int)
+    sp.add_argument("--limit", type=int, default=500)
+
+    sp = sub.add_parser("events", help="list events held here")
+    sp.add_argument("--kind", type=int, action="append")
+    sp.add_argument("--quarantine", action="store_true")
+
+    sp = sub.add_parser("verify-blobs", help="check every blob held here and sign hash_verified and format_scan attestations")
+    _key_args(sp)
+    sp.add_argument("--post", help="send the events to this gateway. Otherwise they are added to the local store")
+
+    sp = sub.add_parser("replicate", help="redo other people's attestations on blobs held here and sign the result")
+    _key_args(sp)
+    sp.add_argument("--from", dest="source", required=True, help="gateway to read attestations from")
+    sp.add_argument("--post", help="gateway to send replications to (default: the --from gateway)")
+
+    sp = sub.add_parser("signer", help="run a signer: holds the key, signs only what its limits allow, keeps an audit log")
+    sp.add_argument("--key-file", help="file holding the secret key. Otherwise THUB_SIGNING_KEY")
+    sp.add_argument("--socket", required=True, help="Unix socket path to listen on (readable by this user only)")
+    sp.add_argument("--audit", required=True, help="audit log file (JSON lines)")
+    sp.add_argument("--read-root", required=True, help="the only folder it will read files from")
+    sp.add_argument("--claims", default="hash_verified,format_scan,replication")
+    sp.add_argument("--max-per-hour", type=int, default=60)
+    sp.add_argument("--max-per-day", type=int, default=500)
+    sp.add_argument("--expires-in", type=int, help="seconds from now after which it signs nothing")
+
+    sp = sub.add_parser("verdict", help="what the attestations here say about a blob, from THUB_ROOTS")
+    sp.add_argument("sha256")
+    sp.add_argument("--claim", default="format_scan")
+    sp.add_argument("--independent", type=int, default=1)
+    sp.add_argument("--min-trust", type=float, default=0.0)
+
+    sp = sub.add_parser("trust", help="how much this gateway trusts a key, from THUB_ROOTS, with the path")
+    sp.add_argument("key", help="public key, hex or npub")
+    sp.add_argument("--scope")
+
+
+def _secret(args, p) -> bytes:
+    from .signing import parse_secret
+
+    raw = Path(args.key_file).read_text() if args.key_file else os.environ.get("THUB_SIGNING_KEY", "")
+    if not raw.strip():
+        p.error("give --key-file or set THUB_SIGNING_KEY")
+    return parse_secret(raw)
+
+
+def _emit(ev: dict, out: str | None) -> None:
+    text = json.dumps(ev, indent=1, sort_keys=True)
+    if out:
+        Path(out).write_text(text)
+        print(json.dumps({"id": ev["id"], "kind": ev["kind"], "file": out}))
+    else:
+        print(text)
+
+
+def run_event_command(args, settings, p) -> None:
+    from .admission import Admission
+    from .eventstore import EventStore
+    from .events import build_delegation, build_endorsement, build_identity, build_revocation
+    from .signing import parse_pubkey
+
+    def key(v):
+        try:
+            return parse_pubkey(v)
+        except ValueError as e:
+            p.error(str(e))
+
+    c = args.cmd
+    try:
+        if c == "identity":
+            _emit(build_identity(_secret(args, p), args.label, key(args.recovery) if args.recovery else None, args.note), args.out)
+        elif c == "delegate":
+            exp = int(time.time()) + args.expires_in if args.expires_in else None
+            _emit(build_delegation(_secret(args, p), key(args.subject), args.scope, expires=exp, redelegable=args.redelegable,
+                                   max_events_per_day=args.max_events_per_day, max_bytes_per_day=args.max_bytes_per_day), args.out)
+        elif c == "endorse":
+            exp = int(time.time()) + args.expires_in if args.expires_in else None
+            _emit(build_endorsement(_secret(args, p), key(args.subject), args.scope, args.weight, delegable=args.delegable, expires=exp), args.out)
+        elif c == "revoke":
+            target = key(args.target) if args.kind == "key" else args.target
+            _emit(build_revocation(_secret(args, p), args.kind, target, args.reason, taint=args.taint), args.out)
+        elif c == "signer":
+            import asyncio
+
+            from .signer import Signer, SignerConfig, serve
+
+            cfg = SignerConfig(Path(args.read_root), Path(args.audit), allowed_claims=tuple(x for x in args.claims.split(",") if x),
+                               max_per_hour=args.max_per_hour, max_per_day=args.max_per_day,
+                               not_after=int(time.time()) + args.expires_in if args.expires_in else None)
+            signer = Signer(_secret(args, p), cfg)
+
+            async def run():
+                srv = await serve(signer, args.socket)
+                print(json.dumps({"listening": args.socket, "pubkey": signer.pubkey}), flush=True)
+                async with srv:
+                    await srv.serve_forever()
+
+            try:
+                asyncio.run(run())
+            except KeyboardInterrupt:
+                pass
+        elif c in ("verify-blobs", "replicate"):
+            from .store import Store
+            from .verifier import Verifier
+
+            secret = _secret(args, p)
+            store = Store(settings.data_dir)
+            ver = Verifier(secret, store)
+            post = args.post if c == "verify-blobs" else (args.post or args.source)
+            tally: dict[str, int] = {}
+
+            def deliver(evs):
+                import httpx
+
+                for ev in evs:
+                    if post:
+                        r = httpx.post(post.rstrip("/") + "/api/thub/events", json=ev, timeout=30)
+                        st = r.json().get("status", f"http{r.status_code}") if r.headers.get("content-type", "").startswith("application/json") else f"http{r.status_code}"
+                    else:
+                        st = Adm(EventStore(settings.data_dir), settings.roots).admit(ev).status
+                    tally[st] = tally.get(st, 0) + 1
+
+            from .admission import Admission as Adm
+            from .signing import public_key as _pk
+
+            me = _pk(secret).hex()
+            if c == "verify-blobs":
+                done = {t[1] for e in EventStore(settings.data_dir).query([36782], [me], limit=500) for t in e["tags"] if t[0] == "x"} if not post else set()
+                for x in store.complete_lfs_blobs():
+                    if x not in done:
+                        deliver(ver.attest_blob(x))
+            else:
+                import httpx
+
+                src = args.source.rstrip("/")
+                atts = httpx.get(src + "/api/thub/events", params={"kinds": 36782, "limit": 500}, timeout=30).json().get("events", [])
+                mine = httpx.get(post.rstrip("/") + "/api/thub/events", params={"kinds": 36782, "authors": me, "limit": 500}, timeout=30).json().get("events", [])
+                redone = {t[1] for e in mine for t in e["tags"] if t[0] == "e"}
+                for att in atts:
+                    if att.get("pubkey") == me or att.get("id") in redone:
+                        continue
+                    out = ver.replicate(att)
+                    if out:
+                        deliver([out])
+            print(json.dumps(tally))
+        elif c in ("events-add", "events-pull", "events", "trust", "verdict"):
+            store = EventStore(settings.data_dir)
+            adm = Admission(store, settings.roots, hops=settings.trust_hops)
+            if c == "events-add":
+                res = adm.admit(json.loads(Path(args.file).read_text()))
+                print(json.dumps({"status": res.status, "reason": res.reason, "tier": res.tier}))
+                if res.status == "rejected":
+                    raise SystemExit(1)
+            elif c == "events-pull":
+                import httpx
+
+                params = {"kinds": args.kinds, "limit": args.limit}
+                if args.author:
+                    params["authors"] = ",".join(parse_pubkey(a) for a in args.author)
+                if args.since is not None:
+                    params["since"] = args.since
+                r = httpx.get(args.url.rstrip("/") + "/api/thub/events", params=params, timeout=30)
+                r.raise_for_status()
+                tally: dict[str, int] = {}
+                for ev in r.json().get("events", []):
+                    st = adm.admit(ev).status
+                    tally[st] = tally.get(st, 0) + 1
+                print(json.dumps(tally))
+            elif c == "verdict":
+                g = adm.graph()
+                v = g.verdict(args.sha256, args.claim, args.independent, args.min_trust)
+                print(json.dumps({"status": v.status, "keys": list(v.keys), "need": v.need, "detail": v.detail, "revoked": g.blob_status(args.sha256),
+                                  "refuted_attestors": sorted(g.refuted_attestors())}, indent=1))
+            elif c == "events":
+                for ev in store.query(args.kind, include_quarantine=args.quarantine, limit=500):
+                    print(ev["id"][:16], ev["kind"], ev["pubkey"][:16], ev["created_at"], store.tier_of(ev["id"]))
+            else:
+                g = adm.graph()
+                k = key(args.key)
+                t = g.trust(k, args.scope)
+                print(json.dumps({"key": k, "scope": args.scope, "trust": t.value, "root": k in g.roots, "member": g.reachable(k),
+                                  "path": [{"from": a[:16], "to": b[:16], "event": e[:16]} for a, b, e in t.path]}, indent=1))
+    except ValueError as e:
+        raise SystemExit(f"error: {e}")
