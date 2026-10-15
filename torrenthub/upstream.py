@@ -123,6 +123,11 @@ class Upstream:
         return self.client.stream("GET", f"/{repo_id}/resolve/{commit}/{quote(path)}")
 
 
+# httpx buffers until it has this many bytes before yielding. Keep it small: on a slow link a big
+# chunk is a long silence for the client, which gives up after ~10s without data.
+STREAM_CHUNK = 64 * 1024
+
+
 class _Primed:
     """A 200 streaming response whose first chunk has already been read."""
 
@@ -385,7 +390,7 @@ class UpstreamSet:
             if r.status_code == 200:
                 # Read the first chunk before committing to this upstream. A hub that answers 200
                 # and then breaks before sending anything is skipped like one that answered 5xx.
-                it = r.aiter_bytes(1 << 20)
+                it = r.aiter_bytes(STREAM_CHUNK)
                 try:
                     first = await it.__anext__()
                 except StopAsyncIteration:

@@ -44,7 +44,7 @@ from .torrent import (
     validate_torrent,
 )
 from .lock import Lockfile
-from .upstream import HubError, Upstream, UpstreamSet, UpstreamUnavailable
+from .upstream import STREAM_CHUNK, HubError, Upstream, UpstreamSet, UpstreamUnavailable
 
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 
@@ -405,7 +405,7 @@ class Mirror:
                         raise HubError(404, "EntryNotFound", f"{rec.path} not found upstream")
                     if r.status_code != 200:
                         raise UpstreamUnavailable(f"upstream returned {r.status_code} for {rec.path}")
-                    async for chunk in r.aiter_bytes(1 << 20):
+                    async for chunk in r.aiter_bytes(STREAM_CHUNK):
                         gaps.tick(len(chunk))
                         await asyncio.to_thread(sink.write, chunk)
                         self.metrics.inc("thub_bytes_fetched_total", len(chunk), source="upstream")
