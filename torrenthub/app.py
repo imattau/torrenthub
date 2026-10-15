@@ -6,6 +6,7 @@ import asyncio
 import fnmatch
 import hashlib
 import mimetypes
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
@@ -239,6 +240,8 @@ def create_app(
     if isinstance(upstream, UpstreamSet):
         upstream.delegation_check = lambda roots, signer, scope: admission.graph().may_sign(roots, signer, scope) is not None
     policy_rules = load_policy(settings.policy)
+    if isinstance(upstream, UpstreamSet) and upstream.manifest_max_age is None:
+        upstream.manifest_max_age = policy_rules.freshness.manifest_max_age  # the environment setting wins if both are given
     mirror = Mirror(settings, store, upstream, swarm, metrics)
     ingest = Ingest(settings, store, swarm, pinned, lambda: admission.graph(), metrics)
 
@@ -385,6 +388,26 @@ def create_app(
                            include_quarantine=q.get("quarantine") == "1")
         return JSONResponse({"events": out}, headers={"X-Mirror": "torrenthub"})
 
+    @app.get("/api/thub/requests")
+    async def list_requests(task: str | None = None, state: str = "open", limit: int = 50):
+        """Requests this hub holds, with where each stands by THIS hub's roots. Informational: an
+        agent that wants an answer it can rely on pulls the events and judges them with its own."""
+        g = admission.graph()
+        now = time.time()
+        out = []
+        for r in g.requests_list():
+            if task and r.task != task:
+                continue
+            st = g.request_status(r.id, now=now)
+            if state == "open" and st.state not in ("open", "claimed", "answered"):
+                continue
+            out.append({"id": r.id, "issuer": r.issuer, "task": r.task, "inputs": list(r.inputs), "args": r.args, "want": r.want,
+                        "deadline": r.deadline, "reward": r.reward, "created_at": r.created_at, "state": st.state,
+                        "claimants": list(st.claimants), "results": st.results})
+            if len(out) >= max(1, min(limit, 500)):
+                break
+        return {"requests": out}
+
     @app.post("/api/thub/publish")
     async def publish(request: Request):
         """Take in a repo a publisher signed (publish.py). Answers at once; the transfer of big
@@ -482,7 +505,7 @@ def create_app(
                 "lockfile_mode": mirror.lock.mode if mirror.lock else None,
                 "manifests_held": len(store.list_manifests(repo_id)),
                 "file_rules": [
-                    {"match": list(r.match), "action": r.action, "claim": r.claim, "independent": r.independent, "min_trust": r.min_trust}
+                    {"match": list(r.match), "action": r.action, "claim": r.claim, "independent": r.independent, "min_trust": r.min_trust, "max_age": r.max_age}
                     for r in policy_rules if fnmatch.fnmatchcase(repo_id, r.repo)
                 ],
             },

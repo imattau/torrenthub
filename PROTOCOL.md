@@ -49,9 +49,9 @@ Common to all events: the NIP-01 layout already in `signing.py` (id, pubkey, cre
 | 36781 | `revocation` | built |
 | 36782 | `attestation` | built |
 | 36783 | `derivation` | built |
-| 36784 | `request` | reserved, P5 |
-| 36785 | `claim` | reserved, P5 |
-| 36786 | `result` | reserved, P5 |
+| 36784 | `request` | built |
+| 36785 | `claim` | built |
+| 36786 | `result` | built |
 
 A change to an event's fields that old readers cannot parse bumps its content `v` field. It does not get a new kind.
 
@@ -90,11 +90,11 @@ The class is a function of the claim type and is not written by the author. Fiel
 Target is an event id, a blob `x`, a key, or a delegation or endorsement. Fields: `reason`, `severity`, `taint` (true means descendants of a blob count as affected), and for a key target an optional `successor`. A revocation with a successor is a key rotation: the old key is revoked, and the endorsements and delegations that pointed at it now point at the successor. What the old key issued stays revoked; the successor issues its own. If the old key declared a recovery key, only the recovery key can name the successor, so a thief holding the old key cannot. If it declared none, the key can name it. The earliest valid statement wins, and a consumer's own roots are never replaced this way. Valid from the target's issuer, from the namespace owner for things in the namespace, or from a key the consumer trusts for scope `revoke`.
 
 ### 3.8 `request`, `claim`, `result`
-Request: task type, inputs by hash, a spec hash, deadline, optional reward pointer. Claim: advisory "I am working on request `e`". Result: an artifact or attestation event referencing the request. A requester judges results by its own policy, usually by replication. NIP-90 (data vending machines) covers similar ground but the NIPs README marks it unrecommended, so this is its own small design, kept small on purpose.
+Request: task type, inputs by hash, a spec hash, deadline, optional reward pointer. Claim: advisory "I am working on request `e`". Result: an artifact or attestation event referencing the request. Built (section 16). A requester judges results by its own policy, usually by replication. NIP-90 (data vending machines) covers similar ground but the NIPs README marks it unrecommended, so this is its own small design, kept small on purpose.
 
 ## 4. Policy
 
-A consumer's policy is a file. Rules say what must hold before a thing is used. The format is TOML, one file per gateway (`THUB_POLICY`, section 11 item 1), and the `[[file]]` rules for `require` (a claim, `independent`, `min_trust`), `deny` and `allow` are built (section 13). A `[lineage]` table with `on_tainted`, `max_synthetic_depth`, `min_trust` and `trusted_tools` is also built (section 14). Of the rule types below, `max_age` is the only one still design only. The rule types are:
+A consumer's policy is a file. Rules say what must hold before a thing is used. The format is TOML, one file per gateway (`THUB_POLICY`, section 11 item 1), and the `[[file]]` rules for `require` (a claim, `independent`, `min_trust`), `deny` and `allow` are built (section 13). A `[lineage]` table with `on_tainted`, `max_synthetic_depth`, `min_trust` and `trusted_tools` is also built (section 14). A per-rule `max_age` and a `[freshness]` table with `manifest_max_age` are built too (section 16), so every rule type below is built. The rule types are:
 
 - `root`: keys pinned with weight 1.
 - `require signed(root[, ...])` for a namespace, as `THUB_TRUST` does now, including delegation chains.
@@ -187,7 +187,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P2 (built, section 13) | Attestations: `hash_verified` and `format_scan`, a verifier agent, replication events, `independent(n)`, a signer process, and the MCP write tools (read and download tools already exist, M0) | A verifier agent publishes, a consumer policy changes behaviour because of it, and a bad attestor is caught by replication |
 | P3 (built, section 14; the gate is only partly met) | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |
 | P4 (built, section 15; gate met in a simulation of NAT, not behind a real router) | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
-| P5 | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
+| P5 (built, section 16; gate met on two machines, with trust set up beforehand) | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
 | P6 | Nostr relay adapter | Events round trip through a real relay, with size limits known |
 
 Public service questions (who pays for the first copy, takedown and abuse policy, IP exposure) stay open in `ARCHITECTURE.md` and are not answered by any phase above.
@@ -326,4 +326,37 @@ Code: `manifest.py` (version 2), `publish.py` (the hub's side), `publisher.py` a
 - `THUB_MANIFEST_MAX_AGE` is an environment setting, not a rule in the policy file.
 - A manifest the hub never receives cannot be told apart from one that does not exist, and a hub can still withhold the newest one. `valid_until`, a maximum age and asking several hubs reduce that; they do not remove it.
 - Only publishing from the command line was exercised. Nothing signs or publishes through the signer process or the MCP server yet.
+
+## 16. What is built (P5)
+
+Code: the `request`, `claim` and `result` events in `events.py` (kinds 36784 to 36786), `Graph.request_status` and friends in `trust.py`, `workflow.py` (the requester, the worker and a participant's local view), `GET /api/thub/requests`, the commands `torrenthub request`, `requests` and `work`, and the freshness rules in `policy.py`. Tests: `tests/test_requests.py`, `tests/test_workflow.py`, plus one freshness test in `tests/test_publish.py`.
+
+**The events**
+- A request names a task (lowercase, up to 64 characters), up to 16 input blobs by sha256, arguments (up to 2000 bytes) or a spec hash, a deadline (after the request and within 30 days of it), what is wanted (`attestation` or `artifact`) and an optional `reward`: an opaque string, up to 200 characters, pointing at wherever settlement happens. The protocol moves no money and never reads the field.
+- A claim says "I am working on this" until `expires`. It is advisory: it stops nobody else, proves nothing, and simply lapses.
+- A result points at the request and carries a status (`done`, `failed`, `declined`). A `done` result carries attestation event ids the worker signed, or output blobs with an optional derivation event. Failed and declined results carry only a note.
+
+**Who believes an answer** (`Graph.request_status`, judged by one consumer's own roots). A result counts when its author is trusted for scope `work:<task>`, it arrived by the deadline, and it holds up. For an attestation request, holding up means: every referenced attestation exists, was signed by the result's author, has the right claim, is about one of the request's inputs, and together they cover every input. For an artifact request it means the result lists outputs. An answer is accepted when `n` workers who are independent (the same test as for attestors: no shared voucher) gave the **same** answer; two different answers that each have enough backing are `disputed`, not resolved. Workers whose attestations a trusted replicator refuted count for nothing. States: `unknown`, `open`, `claimed`, `answered` (results exist, too few trusted workers agree), `accepted`, `disputed`, `expired`. Late results are ignored. A failed scan reported by a trusted worker is an accepted answer ("this file failed"), not a failure of the request.
+
+**The cycle** (`workflow.py`). A requester posts a request and waits: it pulls events from the hub into its own store, so each event is checked again under its own roots, and judges there. A worker pulls the same way, takes requests whose author is a root or trusted for `request:<task>`, claims, fetches the blobs from the hub's `/blobs/<sha256>` (hashing as they arrive), runs the verifier's checks and posts the attestations and the result. Workers here do `hash_verified` and `format_scan`. The answer is an ordinary attestation, so a requester that does not trust a worker can still ask a trusted replicator, and the same attestation counts for any consumer's file policy. The hub lists requests at `GET /api/thub/requests` by its own roots; that is a convenience, and a stranger's requests stay in quarantine and out of the list.
+
+**Freshness.** `max_age` on a `[[file]]` rule (seconds or `"30d"`, `"12h"`, `"90m"`, `"2w"`) means only attestations made within that long count, in both directions: an old failed scan stops blocking, an old pass stops satisfying, and a new one of either kind counts. `[freshness] manifest_max_age` in the policy file is the same limit as `THUB_MANIFEST_MAX_AGE` (P4), which wins if both are set. Request deadlines and claim expiries are the other freshness limits in this section.
+
+**Measured.** Hub and worker on two VMs, requester on this host, a 954 MB published model on the hub, trust set up beforehand by an operator key (it endorsed the workers for `work:*` and `attest:*` and the requester for `request:*`):
+
+| Cycle | Result |
+|---|---|
+| `hash_verified` of the 954 MB file, one worker (on a VM) | accepted in 11 s, states seen by the requester: open, claimed, accepted |
+| `format_scan` of the same file (a real safetensors header check), two independent workers (one on a VM, one on this host) | accepted in 10 s, both keys named as the backing |
+| A requester no one had endorsed | the hub put its request in quarantine, the command refused |
+
+The gate asks for two agents to complete a request cycle with no human step. Nothing was approved while the cycle ran. The trust that lets it run (who may ask, who may answer) was set up by an operator beforehand, as everywhere else in this design; the protocol does not remove that step and a stranger cannot skip it.
+
+**Not built, or limited**
+- Workers do only the two verifier checks. Artifact requests (a worker making new blobs, publishing them with P4 and signing a derivation with P3) are judged by the same agreement rule and tested in the graph, but no worker implements one.
+- Claims do not reserve anything. Two workers may do the same job, which is what a request for `n` independent answers wants and wasteful otherwise. A worker does not remember what it did across restarts, and skips a request only if it has answered it in this run or the hub already shows its result.
+- Everything polls. There is no push, no relay, and a requester that goes away loses nothing but the wait.
+- `disputed` is reported and left to the requester. The remedy this design offers is replication by a third trusted party, which a requester must ask for with another request.
+- Request spam is limited only by admission control (a stranger's requests are quarantined; a member's are rate limited per key).
+- A requester and the hub may disagree about a state, because the hub judges by its roots and the requester by its own.
 

@@ -25,7 +25,10 @@ ENDORSEMENT = 36780
 REVOCATION = 36781
 ATTESTATION = 36782
 DERIVATION = 36783
-KINDS = (IDENTITY, DELEGATION, ENDORSEMENT, REVOCATION, ATTESTATION, DERIVATION)
+REQUEST = 36784
+CLAIM = 36785
+RESULT = 36786
+KINDS = (IDENTITY, DELEGATION, ENDORSEMENT, REVOCATION, ATTESTATION, DERIVATION, REQUEST, CLAIM, RESULT)
 
 # Claim types and how each can be checked (PROTOCOL.md section 3.6). The class comes from here,
 # never from the author. D: anyone can recompute it. R: anyone can re-run it, within tolerance.
@@ -40,6 +43,12 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SCOPE_RE = re.compile(r"^[A-Za-z0-9_.:/*@+-]{1,128}$")
 TARGET_KINDS = ("event", "key", "x")
 DATA_ORIGINS = ("human", "synthetic", "mixed", "unknown")
+TASK_RE = re.compile(r"^[a-z0-9][a-z0-9_.:-]{0,63}$")
+WANTS = ("attestation", "artifact")
+RESULT_STATUSES = ("done", "failed", "declined")
+MAX_DEADLINE_SECONDS = 30 * 86400  # a request cannot stay open longer than this
+MAX_REQUEST_INPUTS = 16
+MAX_REWARD_LEN = 200
 MAX_DERIVATION_REFS = 32
 MAX_ARGS_BYTES = 2000
 MAX_SYNTHETIC_DEPTH = 64
@@ -118,6 +127,48 @@ class Derivation:
     data_origin: str
     synthetic_depth: int
     licences: dict  # {"inputs": {sha256: licence}, "output": licence}
+
+
+@dataclass(frozen=True)
+class Request:
+    """Someone asks for work (PROTOCOL.md 3.8). It is a request, not an order: anyone may ignore
+    it, and it carries no payment. `reward` is an opaque pointer to wherever settlement happens."""
+    id: str
+    issuer: str
+    created_at: int
+    task: str
+    inputs: tuple[str, ...]
+    args: dict
+    spec_x: str | None
+    deadline: int
+    reward: str | None
+    want: str  # "attestation": the answer is attestation events; "artifact": the answer is new blobs
+
+
+@dataclass(frozen=True)
+class Claim:
+    """"I am working on this", good until `expires`. Advisory: it stops nobody else and proves
+    nothing, and a claim that never turns into a result simply lapses."""
+    id: str
+    issuer: str
+    created_at: int
+    request: str
+    expires: int
+
+
+@dataclass(frozen=True)
+class Result:
+    """A worker's answer to a request. The substance is in what it points at: attestation events
+    the worker signed, or output blobs (with a derivation event saying how they were made)."""
+    id: str
+    issuer: str
+    created_at: int
+    request: str
+    status: str
+    attestations: tuple[str, ...]
+    outputs: tuple[tuple[str, str | None, int | None], ...]  # (sha256, infohash, size)
+    derivation: str | None
+    note: str
 
 
 @dataclass(frozen=True)
@@ -255,6 +306,67 @@ def build_derivation(secret: bytes, inputs: list[str], outputs: list[dict], tool
     return sign_event(secret, DERIVATION, tags, _dump(body), _now(created_at))
 
 
+def build_request(secret: bytes, task: str, inputs: list[str], *, args: dict | None = None, spec_x: str | None = None,
+                  deadline: int, want: str = "attestation", reward: str | None = None, created_at: int | None = None) -> dict:
+    ts = _now(created_at)
+    if not isinstance(task, str) or not TASK_RE.match(task):
+        raise ValueError("task: lowercase letters, digits and _ . : - , up to 64")
+    ins = sorted(set(inputs))
+    if len(ins) > MAX_REQUEST_INPUTS or not all(isinstance(x, str) and HEX64.match(x) for x in ins):
+        raise ValueError(f"inputs: up to {MAX_REQUEST_INPUTS} sha256 values")
+    args = args or {}
+    if not isinstance(args, dict) or len(_dump(args)) > MAX_ARGS_BYTES:
+        raise ValueError(f"args must be an object under {MAX_ARGS_BYTES} bytes")
+    if spec_x is not None and not HEX64.match(spec_x):
+        raise ValueError("spec_x must be 64 hex characters")
+    if isinstance(deadline, bool) or not isinstance(deadline, int) or not ts < deadline <= ts + MAX_DEADLINE_SECONDS:
+        raise ValueError(f"deadline must be after the request and within {MAX_DEADLINE_SECONDS // 86400} days of it")
+    if want not in WANTS:
+        raise ValueError(f"want must be one of {WANTS}")
+    if reward is not None and (not isinstance(reward, str) or len(reward) > MAX_REWARD_LEN):
+        raise ValueError(f"reward is an opaque string of up to {MAX_REWARD_LEN} characters")
+    body = {"v": 1, "task": task, "inputs": [{"x": x} for x in ins], "spec": {"args": args, "spec_x": spec_x},
+            "deadline": deadline, "reward": reward, "want": want}
+    tags = [["task", task]] + [["x", x, "input"] for x in ins]
+    return sign_event(secret, REQUEST, tags, _dump(body), ts)
+
+
+def build_claim(secret: bytes, request_id: str, *, expires: int, created_at: int | None = None) -> dict:
+    ts = _now(created_at)
+    if not HEX64.match(request_id):
+        raise ValueError("request id must be 64 hex characters")
+    if isinstance(expires, bool) or not isinstance(expires, int) or expires <= ts:
+        raise ValueError("expires must be after the claim")
+    return sign_event(secret, CLAIM, [["e", request_id, "request"]], _dump({"v": 1, "request": request_id, "expires": expires}), ts)
+
+
+def build_result(secret: bytes, request_id: str, status: str = "done", *, attestations: list[str] | None = None,
+                 outputs: list[dict] | None = None, derivation: str | None = None, note: str = "",
+                 created_at: int | None = None) -> dict:
+    if not HEX64.match(request_id):
+        raise ValueError("request id must be 64 hex characters")
+    if status not in RESULT_STATUSES:
+        raise ValueError(f"status must be one of {RESULT_STATUSES}")
+    atts = sorted(set(attestations or []))
+    outs = sorted(({"x": o["x"], "i": o.get("i"), "size": o.get("size")} for o in (outputs or [])), key=lambda o: o["x"])
+    if len(atts) > MAX_REQUEST_INPUTS or len(outs) > MAX_DERIVATION_REFS or not all(HEX64.match(a) for a in atts):
+        raise ValueError("too many or malformed attestations or outputs")
+    for o in outs:
+        if not HEX64.match(o["x"]) or (o["i"] is not None and not INFOHASH_RE.match(o["i"])):
+            raise ValueError("malformed output")
+        _opt_int(o["size"])
+    if derivation is not None and not HEX64.match(derivation):
+        raise ValueError("derivation must be an event id")
+    if status != "done" and (atts or outs):
+        raise ValueError("only a done result carries attestations or outputs")
+    body = {"v": 1, "request": request_id, "status": status, "attestations": atts, "outputs": outs,
+            "derivation": derivation, "note": note[:500]}
+    tags = [["e", request_id, "request"]] + [["e", a, "attestation"] for a in atts] + [["x", o["x"], "output"] for o in outs]
+    if derivation:
+        tags.append(["e", derivation, "derivation"])
+    return sign_event(secret, RESULT, tags, _dump(body), _now(created_at))
+
+
 def build_attestation(secret: bytes, claim: str, subject_kind: str, subject: str, *, ok: bool | None = None,
                       match: bool | None = None, detail: str = "", tool: str = "", tool_x: str | None = None,
                       evidence: dict | None = None, created_at: int | None = None) -> dict:
@@ -367,6 +479,8 @@ def parse_event(ev: dict, check_sig: bool = True):
                                str(meth.get("tool", ""))[:100], tool_x, CLAIM_CLASS[claim])
         if kind == DERIVATION:
             return _parse_derivation(ev, body, eid, pub, ts)
+        if kind in (REQUEST, CLAIM, RESULT):
+            return _parse_work(kind, ev, body, eid, pub, ts)
         tk = body.get("target_kind")
         if tk not in TARGET_KINDS:
             raise ValueError("bad target_kind")
@@ -431,6 +545,65 @@ def _parse_derivation(ev: dict, body: dict, eid: str, pub: str, ts: int) -> Deri
             _check_tag(ev, "i", i)
     return Derivation(eid, pub, ts, tuple(sorted(in_x)), tuple(sorted(out_rows, key=lambda r: r[0])), tool, tool_x, args,
                       origin, depth, {"inputs": {k: v[:100] for k, v in lic_in.items()}, "output": str(lic.get("output", ""))[:100]})
+
+
+def _parse_work(kind: int, ev: dict, body: dict, eid: str, pub: str, ts: int):
+    if kind == REQUEST:
+        task, want, deadline = body["task"], body["want"], body["deadline"]
+        if not isinstance(task, str) or not TASK_RE.match(task) or want not in WANTS:
+            raise ValueError("bad task or want")
+        if isinstance(deadline, bool) or not isinstance(deadline, int) or not ts < deadline <= ts + MAX_DEADLINE_SECONDS:
+            raise ValueError("bad deadline")
+        ins = [i["x"] for i in body["inputs"]]
+        if len(ins) > MAX_REQUEST_INPUTS or len(set(ins)) != len(ins) or not all(isinstance(x, str) and HEX64.match(x) for x in ins):
+            raise ValueError("bad inputs")
+        spec = body.get("spec") or {}
+        args, spec_x = spec.get("args") or {}, spec.get("spec_x")
+        if not isinstance(args, dict) or len(_dump(args)) > MAX_ARGS_BYTES or (spec_x is not None and not (isinstance(spec_x, str) and HEX64.match(spec_x))):
+            raise ValueError("bad spec")
+        reward = body.get("reward")
+        if reward is not None and (not isinstance(reward, str) or len(reward) > MAX_REWARD_LEN):
+            raise ValueError("bad reward")
+        _check_tag(ev, "task", task)
+        for x in ins:
+            _check_tag(ev, "x", x)
+        return Request(eid, pub, ts, task, tuple(sorted(ins)), args, spec_x, deadline, reward, want)
+    rid = body["request"]
+    if not isinstance(rid, str) or not HEX64.match(rid):
+        raise ValueError("bad request id")
+    _check_tag(ev, "e", rid)
+    if kind == CLAIM:
+        exp = body["expires"]
+        if isinstance(exp, bool) or not isinstance(exp, int) or exp <= ts:
+            raise ValueError("bad expires")
+        return Claim(eid, pub, ts, rid, exp)
+    status = body["status"]
+    if status not in RESULT_STATUSES:
+        raise ValueError("bad status")
+    atts = body.get("attestations") or []
+    outs_raw = body.get("outputs") or []
+    if not (isinstance(atts, list) and isinstance(outs_raw, list)) or len(atts) > MAX_REQUEST_INPUTS or len(outs_raw) > MAX_DERIVATION_REFS:
+        raise ValueError("bad attestations or outputs")
+    if not all(isinstance(a, str) and HEX64.match(a) for a in atts):
+        raise ValueError("bad attestation id")
+    outs = []
+    for o in outs_raw:
+        x, i, size = o["x"], o.get("i"), _opt_int(o.get("size"))
+        if not (isinstance(x, str) and HEX64.match(x)) or (i is not None and not (isinstance(i, str) and INFOHASH_RE.match(i))):
+            raise ValueError("bad output")
+        outs.append((x, i, size))
+    if status != "done" and (atts or outs):
+        raise ValueError("only a done result carries attestations or outputs")
+    der = body.get("derivation")
+    if der is not None and not (isinstance(der, str) and HEX64.match(der)):
+        raise ValueError("bad derivation id")
+    for a in atts:
+        _check_tag(ev, "e", a)
+    for x, _, _ in outs:
+        _check_tag(ev, "x", x)
+    if der:
+        _check_tag(ev, "e", der)
+    return Result(eid, pub, ts, rid, status, tuple(sorted(atts)), tuple(sorted(outs, key=lambda o: o[0])), der, str(body.get("note", ""))[:500])
 
 
 def _check_tag(ev: dict, name: str, value: str) -> None:

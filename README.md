@@ -151,6 +151,7 @@ Gateway endpoints beyond the HF API: `/metrics` (Prometheus text), `/healthz`, `
 | `THUB_ROOTS` | none | Public keys (hex or npub, comma separated) this gateway starts its trust from. Keys named in `signed:` rules count too |
 | `THUB_TRUST_HOPS` | `3` | Longest chain of endorsements followed from a root |
 | `THUB_POLICY` | none | TOML file of rules for what must be attested before a file is served. See `PROTOCOL.md` section 13 |
+| policy `max_age` / `[freshness]` | none | `max_age = "30d"` on a `[[file]]` rule counts only attestations that recent. `[freshness] manifest_max_age` is the same as `THUB_MANIFEST_MAX_AGE` |
 | `THUB_PUBLISH_QUOTA` | `0` | Bytes of published content one signing key may hold here, such as `10G`. 0 turns publishing off. Only roots and their `publish:<repo>` delegates may publish |
 | `THUB_PUBLISH_STALL` / `THUB_PUBLISH_TIMEOUT` | `120` / `3600` | Seconds a publisher may send nothing, and the longest a publication may take |
 | `THUB_MANIFEST_MAX_AGE` | none | Seconds. Refuse to resolve a branch name through a signed manifest older than this |
@@ -224,4 +225,19 @@ torrenthub publish --repo you/model --dir ./model --hub https://hub.example --ke
 ```
 
 It hashes the directory, signs a manifest, sends it with the torrents of the big files, then seeds them and dials the hub, which pulls the bytes and checks them against the signed hashes before anything is visible. Agents fetch it with `THUB_TRUST="you/*=signed:<your public key>"`. Use `--valid-days N` to make a manifest expire.
+
+## Asking for work
+
+Agents can ask each other to check things. A requester posts a request to a hub and waits; a worker watches the hub, claims it, does the check and answers; the requester decides by its own roots whether the answer stands. Each side pulls the events into its own store, so the hub is never trusted for the verdict.
+
+```bash
+# worker (a machine that can reach the hub)
+THUB_ROOTS=<operator key> torrenthub work --hub https://hub.example --key-file worker.key
+
+# requester
+THUB_ROOTS=<operator key> torrenthub request --hub https://hub.example --key-file me.key \
+    --task format_scan --filename model.safetensors --input <sha256> --independent 2 --wait 120
+```
+
+It works once the operator has endorsed the workers for `work:*` and `attest:*` and the requester for `request:*`. See `PROTOCOL.md` section 16.
 

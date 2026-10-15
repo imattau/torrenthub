@@ -413,3 +413,23 @@ def test_a_maximum_manifest_age_can_be_required(hub, tmp_path):
         assert httpx.get(f"{ag.url}/api/models/{REPO}/revision/{c}", timeout=30).status_code == 200
     finally:
         ag.stop()
+
+
+def test_the_manifest_age_limit_can_come_from_the_policy_file(hub, tmp_path):
+    now = int(time.time())
+    c = _inject(hub, SK, _info("a.bin"), ["main"], seq=1, created_at=now - 5000)
+    pol = tmp_path / "policy.toml"
+    pol.write_text("[freshness]\nmanifest_max_age = '10m'\n")
+    ag = agent_for(tmp_path, hub, policy=str(pol))
+    try:
+        r = httpx.get(f"{ag.url}/api/models/{REPO}/revision/main", timeout=30)
+        assert r.status_code == 502 and r.headers["x-error-code"] == "ManifestStale"
+        assert httpx.get(f"{ag.url}/api/models/{REPO}/revision/{c}", timeout=30).status_code == 200
+    finally:
+        ag.stop()
+    # the environment setting wins when both are given
+    ag2 = agent_for(tmp_path / "second", hub, policy=str(pol), manifest_max_age=100_000.0)
+    try:
+        assert httpx.get(f"{ag2.url}/api/models/{REPO}/revision/main", timeout=30).json()["sha"] == c
+    finally:
+        ag2.stop()

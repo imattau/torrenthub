@@ -21,8 +21,8 @@ import fnmatch
 from dataclasses import dataclass, replace
 
 from .events import (
-    DELEGATION, ENDORSEMENT, IDENTITY, REVOCATION, Attestation, Delegation, Derivation, Endorsement, EventInvalid, Identity,
-    Revocation, parse_event,
+    DELEGATION, ENDORSEMENT, IDENTITY, REVOCATION, Attestation, Claim, Delegation, Derivation, Endorsement, EventInvalid, Identity,
+    Request, Result, Revocation, parse_event,
 )
 
 DEFAULT_HOPS = 3
@@ -55,6 +55,30 @@ class Verdict:
     @property
     def ok(self) -> bool:
         return self.status == "satisfied"
+
+
+@dataclass(frozen=True)
+class RequestStatus:
+    """Where a request stands, as seen by one consumer with its own roots.
+
+    unknown    no such live request
+    open       no live claim and no result yet
+    claimed    someone holds a live claim, nothing answered yet
+    answered   results exist but not enough trusted, independent workers agree
+    accepted   enough independent workers this consumer trusts for the task gave the same answer
+    disputed   two different answers each have enough backing
+    expired    the deadline passed without an accepted answer
+    """
+    state: str
+    accepted_by: tuple = ()
+    outcome: tuple | None = None  # the answer that was accepted, or None
+    claimants: tuple = ()
+    results: int = 0
+    detail: str = ""
+
+    @property
+    def done(self) -> bool:
+        return self.state in ("accepted", "disputed", "expired")
 
 
 @dataclass(frozen=True)
@@ -103,6 +127,15 @@ class Graph:
         self._rev = None
         self.derivations = [d for d in ids.values() if isinstance(d, Derivation)
                             and d.id not in self.revoked_events and d.issuer not in self.revoked_keys]
+        live = [e for e in ids.values() if e.id not in self.revoked_events and getattr(e, "issuer", None) not in self.revoked_keys]
+        self.requests: dict[str, Request] = {e.id: e for e in live if isinstance(e, Request)}
+        self._claims: dict[str, list[Claim]] = {}
+        self._results: dict[str, list[Result]] = {}
+        for e in sorted(live, key=lambda e: (e.created_at, e.id)):
+            if isinstance(e, Claim):
+                self._claims.setdefault(e.request, []).append(e)
+            elif isinstance(e, Result):
+                self._results.setdefault(e.request, []).append(e)
         self.attestations = [a for a in ids.values() if isinstance(a, Attestation)
                              and a.id not in self.revoked_events and a.issuer not in self.revoked_keys]
         self._by_subject: dict[tuple, list[Attestation]] = {}
@@ -564,20 +597,88 @@ class Graph:
         self._cache["refuted"] = out
         return out
 
-    def attestors(self, x: str, claim: str, ok: bool = True) -> list[str]:
+    def attestors(self, x: str, claim: str, ok: bool = True, since: int = 0) -> list[str]:
+        """Keys with an attestation of this claim about `x` with this result, made at or after `since`."""
         bad = self.refuted_attestors()
-        return sorted({a.issuer for a in self._by_subject.get((x, claim), ()) if a.ok is ok and a.issuer not in bad})
+        return sorted({a.issuer for a in self._by_subject.get((x, claim), ()) if a.ok is ok and a.issuer not in bad and a.created_at >= since})
 
-    def verdict(self, x: str, claim: str, n: int = 1, min_trust: float = 0.0) -> Verdict:
+    def verdict(self, x: str, claim: str, n: int = 1, min_trust: float = 0.0, max_age: float | None = None) -> Verdict:
         """Do enough independent, trusted attestors say `claim` holds for blob `x`? One trusted
-        attestor saying it does not hold (a failed scan) settles it as negative."""
+        attestor saying it does not hold (a failed scan) settles it as negative. With `max_age`
+        (seconds), only attestations made within that long of this consumer's clock count, in
+        either direction: a freshness policy asks for a recent look, not an old one."""
         scope = f"attest:{claim}"
         floor = max(min_trust - 1e-12, 0.0)
-        negatives = [k for k in self.attestors(x, claim, ok=False) if self.trust(k, scope).value > floor]
+        since = int(self.now - max_age) if max_age else 0
+        negatives = [k for k in self.attestors(x, claim, ok=False, since=since) if self.trust(k, scope).value > floor]
         if negatives:
             return Verdict("negative", tuple(negatives), n, f"{len(negatives)} trusted attestor(s) report a failed {claim}")
-        chosen = self.independent(self.attestors(x, claim, ok=True), scope, n, minimum=floor)
+        chosen = self.independent(self.attestors(x, claim, ok=True, since=since), scope, n, minimum=floor)
         if len(chosen) >= n:
             return Verdict("satisfied", tuple(chosen), n)
-        return Verdict("unsatisfied", tuple(chosen), n, f"{len(chosen)} of {n} independent trusted attestors for {claim}")
+        why = f"{len(chosen)} of {n} independent trusted attestors for {claim}"
+        return Verdict("unsatisfied", tuple(chosen), n, why + (f" within the last {max_age:.0f}s" if max_age else ""))
+
+    # -------------------------------------------------------------- requests
+    def requests_list(self) -> list[Request]:
+        """Live requests, newest first. Includes expired and answered ones: ask request_status."""
+        return sorted(self.requests.values(), key=lambda r: (-r.created_at, r.id))
+
+    def results_for(self, request_id: str) -> list[Result]:
+        return list(self._results.get(request_id, ()))
+
+    def claims_for(self, request_id: str) -> list[Claim]:
+        return list(self._claims.get(request_id, ()))
+
+    def _answer(self, req: Request, res: Result):
+        """What a result says, or None if it does not hold up. For an attestation request that is
+        (subject, ok) for each input, taken from attestation events the worker really signed. For an
+        artifact request it is the set of output hashes."""
+        if res.status != "done":
+            return None
+        if req.want == "artifact":
+            return ("artifact", tuple(sorted(x for x, _, _ in res.outputs))) if res.outputs else None
+        seen = {}
+        for aid in res.attestations:
+            a = self.parsed.get(aid)
+            if (isinstance(a, Attestation) and a.id not in self.revoked_events and a.issuer == res.issuer and a.claim == req.task
+                    and a.subject_kind == "x" and a.subject in req.inputs and a.ok is not None):
+                seen[a.subject] = a.ok
+        if set(seen) != set(req.inputs) or not seen:
+            return None
+        return ("attestation", tuple(sorted(seen.items())))
+
+    def request_status(self, request_id: str, n: int = 1, min_trust: float = 0.0, now: float | None = None) -> RequestStatus:
+        """Judge a request the way this consumer would: a result counts when its author is trusted for
+        scope `work:<task>`, it arrived by the deadline, and it holds up (see _answer). `n`
+        independent workers must give the same answer. Workers whose attestations a trusted
+        replicator refuted count for nothing."""
+        req = self.requests.get(request_id)
+        if req is None:
+            return RequestStatus("unknown")
+        now = self.now if now is None else now
+        scope = f"work:{req.task}"
+        floor = max(min_trust - 1e-12, 0.0)
+        claimants = tuple(sorted({c.issuer for c in self._claims.get(request_id, ()) if c.expires > now and c.created_at <= req.deadline}))
+        results = [r for r in self._results.get(request_id, ()) if r.created_at <= req.deadline]
+        refuted = self.refuted_attestors()
+        groups: dict[tuple, set] = {}
+        for r in results:
+            ans = self._answer(req, r)
+            if ans is not None and r.issuer not in refuted and self.trust(r.issuer, scope).value > floor:
+                groups.setdefault(ans, set()).add(r.issuer)
+        backed = {ans: self.independent(sorted(ws), scope, n, minimum=floor) for ans, ws in groups.items()}
+        backed = {ans: ks for ans, ks in backed.items() if len(ks) >= n}
+        if len(backed) == 1:
+            (ans, ks), = backed.items()
+            return RequestStatus("accepted", tuple(ks), ans, claimants, len(results))
+        if len(backed) > 1:
+            return RequestStatus("disputed", (), None, claimants, len(results), f"{len(backed)} different answers each have {n} independent trusted workers")
+        if now > req.deadline:
+            return RequestStatus("expired", (), None, claimants, len(results), "the deadline passed without an accepted answer")
+        if any(r.status == "done" for r in results):
+            return RequestStatus("answered", (), None, claimants, len(results), f"answers exist but fewer than {n} independent workers trusted for {scope} agree")
+        if claimants:
+            return RequestStatus("claimed", (), None, claimants, len(results))
+        return RequestStatus("open", (), None, claimants, len(results))
 

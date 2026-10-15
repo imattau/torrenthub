@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "request", "requests", "work", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -70,6 +70,35 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--stage", help="folder for the staged big files (default: a temporary one next to the data dir)")
     sp.add_argument("--timeout", type=float, default=3600)
     sp.add_argument("--tracker", action="append", default=[])
+
+    sp = sub.add_parser("request", help="ask for work and wait for an answer you trust (judged by THUB_ROOTS, not by the hub)")
+    _key_args(sp)
+    sp.add_argument("--hub", required=True)
+    sp.add_argument("--task", required=True, help="for example hash_verified or format_scan")
+    sp.add_argument("--input", action="append", default=[], metavar="SHA256")
+    sp.add_argument("--filename", action="append", help="file name hint, so a worker knows which scanner applies")
+    sp.add_argument("--want", default="attestation", choices=list(("attestation", "artifact")))
+    sp.add_argument("--deadline-in", type=float, default=600, help="seconds from now")
+    sp.add_argument("--independent", type=int, default=1, help="how many independent trusted workers must agree")
+    sp.add_argument("--min-trust", type=float, default=0.0)
+    sp.add_argument("--reward", help="an opaque pointer to wherever settlement happens; the protocol does not move money")
+    sp.add_argument("--wait", type=float, default=0, help="seconds to wait for an accepted answer (0: post and exit)")
+
+    sp = sub.add_parser("requests", help="list requests a hub holds")
+    sp.add_argument("--hub", required=True)
+    sp.add_argument("--task")
+    sp.add_argument("--all", action="store_true", help="include accepted and expired ones")
+
+    sp = sub.add_parser("work", help="serve requests from a hub: claim, do the work, answer")
+    _key_args(sp)
+    sp.add_argument("--hub", required=True)
+    sp.add_argument("--tasks", default="hash_verified,format_scan")
+    sp.add_argument("--poll", type=float, default=5.0)
+    sp.add_argument("--once", action="store_true", help="one pass, then exit")
+    sp.add_argument("--max", type=int, help="exit after this many requests")
+    sp.add_argument("--idle-exit", type=float, help="exit after this many seconds with nothing to do")
+    sp.add_argument("--lease", type=float, default=300, help="seconds a claim lasts")
+    sp.add_argument("--max-bytes", type=int, default=8 * 1024**3)
 
     sp = sub.add_parser("lineage", help="what trusted derivation events say about a blob (from THUB_ROOTS)")
     sp.add_argument("sha256")
@@ -175,6 +204,41 @@ def run_event_command(args, settings, p) -> None:
             _emit(build_derivation(_secret(args, p), args.input, outs, args.tool, tool_x=args.tool_x, args=json.loads(args.args),
                                    data_origin=args.origin, synthetic_depth=args.depth,
                                    licences={"output": args.licence_out}), args.out)
+        elif c == "request":
+            from .workflow import Participant, make_request, wait_for_answer
+
+            part = Participant(settings.data_dir / "agent", settings.roots, args.hub, _secret(args, p), settings.trust_hops)
+            a = {"filename": args.filename} if args.filename else None
+            try:
+                ev = make_request(part, args.task, args.input, deadline_in=args.deadline_in, args=a, want=args.want, reward=args.reward)
+            except RuntimeError as e:
+                raise SystemExit(f"error: {e}")
+            print(json.dumps({"request": ev["id"], "task": args.task}), flush=True)
+            if args.wait > 0:
+                st = wait_for_answer(part, ev["id"], n=args.independent, min_trust=args.min_trust, timeout=args.wait,
+                                     progress=lambda s: print(f"  {s.state}", flush=True))
+                print(json.dumps({"state": st.state, "accepted_by": list(st.accepted_by), "outcome": st.outcome, "detail": st.detail}))
+                if st.state != "accepted":
+                    raise SystemExit(1)
+        elif c == "requests":
+            import httpx
+
+            r = httpx.get(args.hub.rstrip("/") + "/api/thub/requests", params={"state": "all" if args.all else "open", **({"task": args.task} if args.task else {})}, timeout=30)
+            r.raise_for_status()
+            for q in r.json()["requests"]:
+                print(q["id"][:16], q["task"], q["state"], f"{len(q['inputs'])} input(s)", "claimed by " + ",".join(k[:8] for k in q["claimants"]) if q["claimants"] else "")
+        elif c == "work":
+            from .workflow import Participant, Worker
+
+            part = Participant(settings.data_dir / "agent", settings.roots, args.hub, _secret(args, p), settings.trust_hops)
+            w = Worker(part, tuple(t for t in args.tasks.split(",") if t), lease=args.lease, max_bytes=args.max_bytes)
+            print(json.dumps({"worker": part.pubkey, "tasks": list(w.tasks)}), flush=True)
+            try:
+                done = w.run(poll=args.poll, max_requests=args.max, once=args.once, idle_exit=args.idle_exit)
+            except KeyboardInterrupt:
+                done = []
+            for o in done:
+                print(json.dumps({"request": o.request, "action": o.action, "detail": o.detail}))
         elif c == "publish":
             import asyncio
             import tempfile

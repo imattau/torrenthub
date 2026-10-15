@@ -11,10 +11,16 @@ below.
     claim = "format_scan"                   # for require
     independent = 2                         # how many independent trusted attestors, default 1
     min_trust = 0.5                         # each must have at least this trust for attest:<claim>
+    max_age = "30d"                         # only attestations made within this long count (default: any age)
     reason = "pickle weights need two scans"   # optional text shown to the user
 
 Always checked first, whatever the rules say: a blob that a key this gateway trusts for scope
 "revoke" has revoked is refused.
+
+An optional [freshness] table asks for recent evidence about the metadata itself:
+
+    [freshness]
+    manifest_max_age = "30d"         # refuse a branch name whose newest signed manifest is older (same as THUB_MANIFEST_MAX_AGE)
 
 An optional [lineage] table sets rules about where a blob came from. They also run before the
 file rules, and only use derivation events from keys this gateway trusts for scope "derive":
@@ -55,6 +61,7 @@ class Rule:
     independent: int = 1
     min_trust: float = 0.0
     reason: str = ""
+    max_age: float | None = None  # seconds; attestations older than this do not count
 
     def applies(self, repo: str, path: str) -> bool:
         name = path.rsplit("/", 1)[-1]
@@ -70,10 +77,34 @@ class Lineage:
     trusted_tools: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class Freshness:
+    manifest_max_age: float | None = None
+
+
 class RuleList(list):
-    """The [[file]] rules, which are a plain list, plus the [lineage] settings."""
+    """The [[file]] rules, which are a plain list, plus the [lineage] and [freshness] settings."""
 
     lineage: Lineage = Lineage()
+    freshness: Freshness = Freshness()
+
+
+_UNITS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def parse_duration(v, what: str) -> float:
+    """Seconds, from a number or a string such as "90m", "12h", "30d", "2w"."""
+    if isinstance(v, bool):
+        raise PolicyError(f"{what}: not a duration")
+    if isinstance(v, (int, float)):
+        secs = float(v)
+    elif isinstance(v, str) and len(v) >= 2 and v[-1] in _UNITS and v[:-1].replace(".", "", 1).isdigit():
+        secs = float(v[:-1]) * _UNITS[v[-1]]
+    else:
+        raise PolicyError(f"{what}: expected seconds or a duration like 90m, 12h, 30d")
+    if not 0 < secs <= 10 * 365 * 86400:
+        raise PolicyError(f"{what}: a duration must be positive and under ten years")
+    return secs
 
 
 @dataclass
@@ -112,13 +143,17 @@ def parse_policy(text: str) -> RuleList:
         doc = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise PolicyError(f"policy is not valid TOML: {e}") from e
-    unknown = set(doc) - {"file", "lineage"}
+    unknown = set(doc) - {"file", "lineage", "freshness"}
     if unknown:
         raise PolicyError(f"unknown policy section(s): {sorted(unknown)}")
     rules = RuleList()
     rules.lineage = _parse_lineage(doc.get("lineage", {}))
+    fr = doc.get("freshness", {})
+    if set(fr) - {"manifest_max_age"}:
+        raise PolicyError(f"[freshness]: unknown key(s) {sorted(set(fr) - {'manifest_max_age'})}")
+    rules.freshness = Freshness(parse_duration(fr["manifest_max_age"], "[freshness] manifest_max_age") if "manifest_max_age" in fr else None)
     for i, r in enumerate(doc.get("file", [])):
-        bad = set(r) - {"repo", "match", "action", "claim", "independent", "min_trust", "reason"}
+        bad = set(r) - {"repo", "match", "action", "claim", "independent", "min_trust", "reason", "max_age"}
         if bad:
             raise PolicyError(f"rule {i + 1}: unknown key(s) {sorted(bad)}")
         action = r.get("action", "require")
@@ -141,7 +176,8 @@ def parse_policy(text: str) -> RuleList:
             raise PolicyError(f"rule {i + 1}: independent must be a whole number from 1 to 20")
         if isinstance(mt, bool) or not isinstance(mt, (int, float)) or not 0 <= mt <= 1:
             raise PolicyError(f"rule {i + 1}: min_trust must be between 0 and 1")
-        rules.append(Rule(str(r.get("repo", "*")), tuple(match), action, claim, n, float(mt), str(r.get("reason", ""))[:300]))
+        age = parse_duration(r["max_age"], f"rule {i + 1}: max_age") if "max_age" in r else None
+        rules.append(Rule(str(r.get("repo", "*")), tuple(match), action, claim, n, float(mt), str(r.get("reason", ""))[:300], age))
     return rules
 
 
@@ -181,7 +217,7 @@ def check_file(rules: list[Rule], graph: Graph, repo: str, path: str, sha256: st
         why = rule.reason or f"policy rule {i + 1} requires {rule.independent} independent {rule.claim} attestation(s)"
         if not sha256:
             return Decision(False, f"{why}; {path} has no sha256 to attach attestations to", rule=i)
-        v = graph.verdict(sha256, rule.claim, rule.independent, rule.min_trust)
+        v = graph.verdict(sha256, rule.claim, rule.independent, rule.min_trust, rule.max_age)
         if v.ok:
             return Decision(True, rule=i, attested_by=v.keys, notes=notes)
         return Decision(False, f"{why} ({v.detail})", rule=i, attested_by=v.keys)
