@@ -125,6 +125,8 @@ class Settings:
     # Static peer hints, "host:port" each. For a known sibling gateway, or to tell "the transfer
     # works" apart from "peer discovery works" when testing. Normal discovery is still on.
     peers: list[str] = field(default_factory=list)
+    # Dial peers over uTP first (libtorrent's default). Off: dial TCP. See swarm.py for why.
+    outgoing_utp: bool = False
     # Keys this gateway pins as roots (hex or npub). Events from keys reachable from a root go in
     # the main event store with a large allowance. Everyone else is quarantined. See PROTOCOL.md.
     roots: list[str] = field(default_factory=list)
@@ -180,6 +182,7 @@ class Settings:
             swarm=e("THUB_SWARM", "none"),
             listen_port=int(e("THUB_LISTEN_PORT", "6881")),
             peers=_list(e("THUB_PEERS"), []),
+            outgoing_utp=_bool(e("THUB_OUTGOING_UTP"), False),
             roots=parse_keys(e("THUB_ROOTS")),
             trust_hops=int(e("THUB_TRUST_HOPS", "3")),
             policy=e("THUB_POLICY") or None,

@@ -226,7 +226,7 @@ def create_app(
 ) -> FastAPI:
     store = Store(settings.data_dir)
     upstream = upstream or make_upstream(settings)
-    swarm = swarm or make_swarm(settings.swarm, settings.listen_port, settings.peers)
+    swarm = swarm or make_swarm(settings.swarm, settings.listen_port, settings.peers, settings.outgoing_utp)
     metrics = Metrics()
     events = EventStore(settings.data_dir)
     # Keys named in `signed:` rules are roots too: naming a key there already pins it.

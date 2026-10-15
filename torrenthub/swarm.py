@@ -30,6 +30,10 @@ class SwarmDownload:
     def peers(self) -> int:
         return 0
 
+    def snapshot(self) -> dict:
+        """Bytes libtorrent has downloaded (checked or not), its download rate and peer count."""
+        return {}
+
     def cancel(self) -> None:
         """Stop downloading. Does not delete files."""
 
@@ -93,6 +97,10 @@ class _LtDownload(SwarmDownload):
     def peers(self) -> int:
         return self._h.status().num_peers
 
+    def snapshot(self) -> dict:
+        st = self._h.status()
+        return {"done": st.total_done, "rate": st.download_rate, "peers": st.num_peers}
+
     def cancel(self) -> None:
         if self._h.is_valid():
             self._ses.remove_torrent(self._h)
@@ -108,6 +116,7 @@ class LibtorrentSwarm(Swarm):
         extra_peers: list[tuple[str, int]] | None = None,
         dht: bool = True,
         upload_limit: int = 0,
+        outgoing_utp: bool = False,
     ):
         import libtorrent as lt
 
@@ -122,6 +131,10 @@ class LibtorrentSwarm(Swarm):
             "enable_upnp": False,
             "enable_natpmp": False,
             "allow_multiple_connections_per_ip": True,
+            # libtorrent dials over uTP (UDP) first by default. Between two machines on a fast
+            # link that measured about 20 MB/s against 350 MB/s over TCP, so dial TCP. Incoming
+            # uTP stays on, so peers that prefer it can still reach us.
+            "enable_outgoing_utp": outgoing_utp,
         }
         if upload_limit:
             settings["upload_rate_limit"] = upload_limit
@@ -188,7 +201,7 @@ def parse_peers(items: list[str]) -> list[tuple[str, int]]:
     return peers
 
 
-def make_swarm(kind: str, listen_port: int, peers: list[str] | None = None) -> Swarm:
+def make_swarm(kind: str, listen_port: int, peers: list[str] | None = None, outgoing_utp: bool = False) -> Swarm:
     if kind == "libtorrent":
-        return LibtorrentSwarm(listen_port, extra_peers=parse_peers(peers or []))
+        return LibtorrentSwarm(listen_port, extra_peers=parse_peers(peers or []), outgoing_utp=outgoing_utp)
     return NullSwarm()

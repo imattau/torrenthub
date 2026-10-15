@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import hashlib
+import logging
 import os
 import re
 import time
@@ -62,6 +63,9 @@ def files_from_info(info: dict) -> list[FileRec]:
                 raise HubError(502, "UpstreamUnavailable", f"no blobId for {s['rfilename']}")
             out.append(FileRec(s["rfilename"], int(s["size"]), blob_id, f"git-{blob_id}", False))
     return out
+
+
+log = logging.getLogger("torrenthub.mirror")
 
 
 class _Sink:
@@ -347,11 +351,16 @@ class Mirror:
             info = bdecode(data)[b"info"]
             inf.piece_check = (info[b"piece length"], info[b"pieces"])
             seen = 0
-            last_move = time.monotonic()
+            started = last_move = last_log = time.monotonic()
             try:
                 while not dl.complete():
                     pos = dl.prefix_bytes()
                     now = time.monotonic()
+                    if now - last_log >= 5:
+                        last_log = now
+                        snap = dl.snapshot()
+                        log.info("swarm %s: %.0fs, %.0f MB checked prefix, %.0f MB downloaded, %.1f MB/s, %s peers",
+                                 rec.path, now - started, pos / 1e6, snap.get("done", 0) / 1e6, snap.get("rate", 0) / 1e6, snap.get("peers", "?"))
                     if pos != seen:
                         seen, last_move = pos, now
                         await inf.progress(pos)

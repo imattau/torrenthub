@@ -151,6 +151,7 @@ Gateway endpoints beyond the HF API: `/metrics` (Prometheus text), `/healthz`, `
 | `THUB_ROOTS` | none | Public keys (hex or npub, comma separated) this gateway starts its trust from. Keys named in `signed:` rules count too |
 | `THUB_TRUST_HOPS` | `3` | Longest chain of endorsements followed from a root |
 | `THUB_POLICY` | none | TOML file of rules for what must be attested before a file is served. See `PROTOCOL.md` section 13 |
+| `THUB_OUTGOING_UTP` | `false` | Dial peers over uTP first, which is libtorrent's own default. Off means TCP. Between two machines on a fast link uTP-first was about 15x slower |
 | `THUB_PEERS` | none | Static peer hints, `host:port` comma separated. Discovery stays on. Useful to tell "transfer works" from "discovery works" |
 | `THUB_SWARM_FIRST` | `false` | Agent mode: fetch the torrent from the upstream hub and download from peers first |
 | `THUB_SWARM_STALL` | `20` | Seconds with no swarm bytes before falling back to HTTP from the upstream |

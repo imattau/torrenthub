@@ -19,7 +19,7 @@ def _mirror(settings: Settings) -> Mirror:
         settings,
         Store(settings.data_dir),
         make_upstream(settings),
-        make_swarm(settings.swarm, settings.listen_port, settings.peers),
+        make_swarm(settings.swarm, settings.listen_port, settings.peers, settings.outgoing_utp),
     )
 
 

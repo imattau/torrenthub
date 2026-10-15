@@ -103,3 +103,29 @@ def test_gateway_refills_evicted_blob_from_swarm(upstream, tmp_path):
         assert store.blob_complete(sha)  # refilled and verified
     finally:
         gw.stop()
+
+
+def test_outgoing_connections_use_tcp_unless_asked():
+    """uTP first is libtorrent's default and was about 15x slower between two machines."""
+
+    async def run():
+        a = LibtorrentSwarm(free_port(), dht=False)
+        b = LibtorrentSwarm(free_port(), dht=False, outgoing_utp=True)
+        try:
+            sa, sb = a.ses.get_settings(), b.ses.get_settings()
+            assert sa["enable_outgoing_utp"] is False and sa["enable_incoming_utp"] is True
+            assert sb["enable_outgoing_utp"] is True
+        finally:
+            await a.close()
+            await b.close()
+
+    asyncio.run(run())
+
+
+def test_env_switches_outgoing_utp(monkeypatch, tmp_path):
+    from torrenthub.config import Settings
+
+    monkeypatch.setenv("THUB_DATA", str(tmp_path))
+    assert Settings.from_env().outgoing_utp is False
+    monkeypatch.setenv("THUB_OUTGOING_UTP", "true")
+    assert Settings.from_env().outgoing_utp is True
