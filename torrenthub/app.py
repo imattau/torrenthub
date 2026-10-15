@@ -18,6 +18,7 @@ from .admission import Admission
 from .config import Settings
 from .eventstore import EventStore
 from .metrics import Metrics
+from .gaplog import GapLog
 from .mirror import Inflight, Mirror
 from .policy import check_file, load_policy
 from .store import Store
@@ -153,6 +154,8 @@ async def iter_inflight(inf: Inflight, start: int, end: int, on_bytes: OnBytes |
     pos = start
     f = None  # opened after the first release: the source file can change before that point
     cached_idx, cached = -1, b""
+    gaps = GapLog(f"client {inf.rec.path}", inf.gap_warn)
+    outcome = "client left"
     try:
         while pos <= end:
             try:
@@ -185,8 +188,14 @@ async def iter_inflight(inf: Inflight, start: int, end: int, on_bytes: OnBytes |
             pos += n
             if on_bytes:
                 on_bytes(n)
+            gaps.tick(n)
             yield data
+        outcome = "ok"
+    except StreamAborted:
+        outcome = "aborted"
+        raise
     finally:
+        gaps.done(outcome)
         if f is not None:
             f.close()
 

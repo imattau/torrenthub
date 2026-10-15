@@ -206,3 +206,7 @@ Built: identity, delegation, endorsement, revocation and attestation events, a t
 - File failover only happens before bytes flow. A broken stream is not moved to another hub.
 - No auth, no private or gated repos, no search, datasets or spaces.
 - Takedown stops this gateway serving and seeding. It cannot remove content from peers who already have it.
+
+## Diagnosing stalls
+
+`THUB_GAP_WARN` (seconds, default 5, 0 disables) logs pauses in a stream on the `torrenthub.gaps` logger, once for the upstream download and once for each client reading it, with a summary line when each ends. Compare the two max gaps to tell an upstream stall from bytes held back by the gateway (1 MiB upstream chunks plus `THUB_STREAM_HOLDBACK`). A client that sees no data for ~10s gives up, which is the `huggingface_hub` read timeout.

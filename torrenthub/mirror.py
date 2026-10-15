@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 from .config import Settings
+from .gaplog import GapLog
 from .metrics import Metrics
 from .store import BlobRow, FileRec, Store
 from .swarm import Swarm
@@ -89,6 +90,8 @@ class _Sink:
 
 class Inflight:
     """A download in progress that any number of clients can read from."""
+
+    gap_warn = 5.0  # seconds; see gaplog.py
 
     def __init__(self, rec: FileRec, tmp: Path, final: Path, holdback: int):
         self.rec = rec
@@ -254,6 +257,7 @@ class Mirror:
             if key in self._inflight:
                 return self._inflight[key]
             inf = Inflight(rec, self.store.tmp_path(key), path, self.s.stream_holdback)
+            inf.gap_warn = self.s.gap_warn
             self._inflight[key] = inf
             inf.task = asyncio.create_task(self._run_blob(repo_id, commit, rec, path, inf))
             return inf
@@ -393,6 +397,7 @@ class Mirror:
         tmp = self.store.tmp_path(key)
         inf.tmp = tmp
         sink = _Sink(tmp, rec, piece_length)
+        gaps = GapLog(f"upstream {repo_id}/{rec.path}", self.s.gap_warn)
         try:
             try:
                 async with self.upstream.stream_file(repo_id, commit, rec.path) as r:
@@ -401,6 +406,7 @@ class Mirror:
                     if r.status_code != 200:
                         raise UpstreamUnavailable(f"upstream returned {r.status_code} for {rec.path}")
                     async for chunk in r.aiter_bytes(1 << 20):
+                        gaps.tick(len(chunk))
                         await asyncio.to_thread(sink.write, chunk)
                         self.metrics.inc("thub_bytes_fetched_total", len(chunk), source="upstream")
                         await inf.progress(sink.size)
@@ -410,6 +416,7 @@ class Mirror:
                 raise UpstreamUnavailable(f"{type(e).__name__}: {e}") from e
         finally:
             sink.close()
+            gaps.done()
 
         # Integrity: never publish bytes that do not match what upstream advertised.
         problem = None

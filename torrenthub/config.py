@@ -116,6 +116,8 @@ class Settings:
     torrent_min_size: int = 1024 * 1024
     # How long a branch name (for example "main") is trusted before re-checking upstream.
     ref_ttl: float = 300.0
+    # Log pauses of at least this many seconds in upstream and client streams. 0 turns it off.
+    gap_warn: float = 5.0
     # Also list the upstream resolve URL as a web seed in each torrent.
     webseed_upstream: bool = True
     swarm: str = "none"  # "none" or "libtorrent"
@@ -188,6 +190,7 @@ class Settings:
             stream_holdback=parse_size(e("THUB_STREAM_HOLDBACK"), 1024 * 1024),
             allow=_list(e("THUB_ALLOW"), ["*"]),
             deny=_list(e("THUB_DENY"), []),
+            gap_warn=float(e("THUB_GAP_WARN", "5")),
             prefetch=_bool(e("THUB_PREFETCH"), False),
             prefetch_concurrency=int(e("THUB_PREFETCH_CONCURRENCY", "2")),
         )
