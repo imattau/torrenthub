@@ -1,4 +1,4 @@
-# Participants: a protocol sketch (v0.4, part built, P0 review done)
+# Participants: a protocol sketch (v0.4, part built, P0 passed)
 
 Status: P1 and P2 are built and tested (sections 12 and 13 say exactly what, and what is not): identity, delegation, endorsement, revocation and attestation events, the trust evaluator, the event store, admission control, the HTTP API, the CLI, the policy file, a verifier, replication, a signer and the MCP write tool. Derivations, requests, the publishing path and everything after P2 are still design only. Event kind numbers were checked against the NIPs registry on 2026-10-16 and are assigned in section 3. Nothing has been run against a real network or real participants, and the validation work in `validation/README.md` still comes first.
 
@@ -182,7 +182,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | Phase | Work | Gate to move on |
 |---|---|---|
 | V | Run the validation kit on real Hugging Face and real machines | Probe passes (including Xet backed repos), live test matches, peers find each other, peer share is worth having |
-| P0 (review done 2026-10-16; waiting for your approval) | Review this document. Assign kind numbers after rechecking the registry. Policy format decided (section 11). | You approve, open questions in section 11 answered |
+| P0 (passed 2026-10-16: approved, decisions in `ARCHITECTURE.md` section 11) | Review this document. Assign kind numbers after rechecking the registry. Policy format decided (section 11). | You approve, open questions in section 11 answered |
 | P1 (partly built, section 12) | Generalise to an event store and API. Identity, delegation, endorsement and revocation events. The trust evaluator and policy engine. CLI. Admission control. | The simulation tests in section 9 pass, including order independence and the sybil and collusion cases, with timings for a large event set |
 | P2 (built, section 13) | Attestations: `hash_verified` and `format_scan`, a verifier agent, replication events, `independent(n)`, a signer process, and the MCP write tools (read and download tools already exist, M0) | A verifier agent publishes, a consumer policy changes behaviour because of it, and a bad attestor is caught by replication |
 | P3 | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |

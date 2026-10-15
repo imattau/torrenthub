@@ -286,7 +286,7 @@ The direction since then is **participants**: humans and AI agents on equal term
 | Phase | Work | Gate to move on |
 |---|---|---|
 | V | Run `validation/` on real Hugging Face (including Xet backed repos) and on two real machines. Measure the peer share. | Probe passes, live test matches, peers find each other, the peer share is worth having. If not, the design changes first. |
-| P0 (review done 2026-10-16: kinds checked and assigned, policy format is TOML) | Review `PROTOCOL.md`, assign event kinds after rechecking the registry, decide the policy file format | Approval, and the open questions in `PROTOCOL.md` section 11 answered |
+| P0 (passed 2026-10-16: kinds checked and assigned, policy format is TOML, decisions in section 11) | Review `PROTOCOL.md`, assign event kinds after rechecking the registry, decide the policy file format | Approval, and the open questions in `PROTOCOL.md` section 11 answered |
 | P1 (first slice built: events, trust evaluator, store, admission, API, CLI, delegation in `signed:` rules; policy file not built, see `PROTOCOL.md` section 12) | Event store and API, identity, delegation, endorsement and revocation events, the trust evaluator, policy engine, admission control | The sybil, collusion, revocation, taint and order independence simulations pass |
 | P2 (built: see `PROTOCOL.md` section 13; `eval` and class R not built) | Attestations (`hash_verified`, `format_scan`), a verifier agent, replication events, a signer process with limits, and the MCP write tools (the read and download MCP server, `torrenthub mcp`, already exists; `PROTOCOL.md` section 8a) | A verifier agent publishes and a consumer's behaviour changes because of it. A bad attestor is caught. |
 | P3 | Reproducible derivations (first measure bit exactness of one tool across machines) | Measured on two machines, or the tool stays self-reported |
@@ -296,9 +296,11 @@ The direction since then is **participants**: humans and AI agents on equal term
 
 Still open from earlier work and carried into the plan: freshness and key rotation (P1, P4), an upload path (P4), a packaged daemon, scheduled `gc`, gated and private repos, datasets (all after V).
 
-## 11. Open questions
+## 11. Decisions (P0, approved 2026-10-16)
 
-- Who runs the index, and who pays for the first full copy of each model?
-- Do you want a public service, or a tool people self-host? Public means takedown and abuse policy matter from day one.
-- Which models first? A small curated set (popular open-weight models) is a more credible start than all of Hugging Face.
-- Is agent mode acceptable given the peer IP exposure?
+Each can be revisited when validation or a real deployment gives data.
+
+- **Who runs the index, and who pays for the first copy?** Whoever runs a hub pays for its own first copy. No shared index yet.
+- **Public service or self-hosted tool?** Self-hosted first. A public service means takedown and abuse policy from day one, so it waits.
+- **Which models first?** A small curated set of popular open-weight models, not all of Hugging Face.
+- **Is agent mode acceptable given peer IP exposure?** Yes, as opt-in with a clear warning. The hub-only HTTP path stays the default.
