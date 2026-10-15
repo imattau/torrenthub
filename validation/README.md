@@ -105,7 +105,7 @@ I will not call anything proven until it has come back from a real run.
 
 ## Results so far
 
-Run 2026-10-15/16 from one machine on a slow link (about 16 KB/s to 70 KB/s to huggingface.co).
+Run 2026-10-15/16 from one machine. Steps 1 and 2 were first run over a congested Wi-Fi link (about 16 to 70 KB/s to huggingface.co, 75 to 140 ms to the router). That exposed real behaviour under slow links, fixed below. Once the machine was on Ethernet (about 5 MB/s to huggingface.co, 50 MB/s to CDNs, 0.5 ms to the router) the live check on the same three repos took 24 s instead of 194 s, with no client timeouts and a longest silence of 2.1 s.
 
 | Step | Result |
 |---|---|
@@ -113,6 +113,6 @@ Run 2026-10-15/16 from one machine on a slow link (about 16 KB/s to 70 KB/s to h
 | 2. Live gateway test | PASS on the same three repos, every file byte for byte. Needed two fixes first: 64 KiB upstream chunks and a 64 KiB holdback, because 1 MiB of each left slow-link clients without data for over 10s. |
 | 3. Two machines | Not run |
 | 4. Measure | Not run |
-| 5. Big model | Not run. Largest file tested: 17.7 MB |
+| 5. Big model | Not run. Largest file tested: 17.7 MB. Now practical: at 5 MB/s a 1 GB model takes a few minutes |
 
 Not covered by the repos above: a recently created repo (the probe's own advice), gated repos, sharded weights, anything over 20 MB.
