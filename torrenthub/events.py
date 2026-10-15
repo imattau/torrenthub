@@ -24,7 +24,8 @@ DELEGATION = 36779
 ENDORSEMENT = 36780
 REVOCATION = 36781
 ATTESTATION = 36782
-KINDS = (IDENTITY, DELEGATION, ENDORSEMENT, REVOCATION, ATTESTATION)
+DERIVATION = 36783
+KINDS = (IDENTITY, DELEGATION, ENDORSEMENT, REVOCATION, ATTESTATION, DERIVATION)
 
 # Claim types and how each can be checked (PROTOCOL.md section 3.6). The class comes from here,
 # never from the author. D: anyone can recompute it. R: anyone can re-run it, within tolerance.
@@ -38,6 +39,11 @@ LABELS = ("human", "agent", "org", "unspecified")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 SCOPE_RE = re.compile(r"^[A-Za-z0-9_.:/*@+-]{1,128}$")
 TARGET_KINDS = ("event", "key", "x")
+DATA_ORIGINS = ("human", "synthetic", "mixed", "unknown")
+MAX_DERIVATION_REFS = 32
+MAX_ARGS_BYTES = 2000
+MAX_SYNTHETIC_DEPTH = 64
+INFOHASH_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 
 class EventInvalid(Exception):
@@ -95,6 +101,23 @@ class Attestation:
     tool: str
     tool_x: str | None
     cls: str
+
+
+@dataclass(frozen=True)
+class Derivation:
+    """Outputs made from inputs by a named tool. What the issuer says, not what is true: it is
+    class D only for a consumer that lists the tool's hash as bit exact (PROTOCOL.md 3.5)."""
+    id: str
+    issuer: str
+    created_at: int
+    inputs: tuple[str, ...]  # sha256 of each input blob
+    outputs: tuple[tuple[str, str | None, int | None], ...]  # (sha256, infohash, size)
+    tool: str
+    tool_x: str | None  # sha256 of the tool or its container image
+    args: dict
+    data_origin: str
+    synthetic_depth: int
+    licences: dict  # {"inputs": {sha256: licence}, "output": licence}
 
 
 @dataclass(frozen=True)
@@ -187,6 +210,49 @@ def build_revocation(secret: bytes, target_kind: str, target: str, reason: str =
         body["successor"] = successor
         tags.append(["p", successor, "successor"])
     return sign_event(secret, REVOCATION, tags, _dump(body), _now(created_at))
+
+
+def build_derivation(secret: bytes, inputs: list[str], outputs: list[dict], tool: str, *, tool_x: str | None = None,
+                     args: dict | None = None, data_origin: str = "unknown", synthetic_depth: int = 0,
+                     licences: dict | None = None, created_at: int | None = None) -> dict:
+    """`outputs` is a list of {"x": sha256, "i": infohash or None, "size": bytes or None}."""
+    args = args or {}
+    licences = licences or {}
+    ins = sorted(set(inputs))
+    if not 1 <= len(ins) <= MAX_DERIVATION_REFS or not all(HEX64.match(x) for x in ins):
+        raise ValueError(f"inputs: 1 to {MAX_DERIVATION_REFS} sha256 values")
+    if not 1 <= len(outputs) <= MAX_DERIVATION_REFS:
+        raise ValueError(f"outputs: 1 to {MAX_DERIVATION_REFS} entries")
+    outs, seen = [], set()
+    for o in outputs:
+        x, i, size = o["x"], o.get("i"), o.get("size")
+        if not HEX64.match(x) or x in seen:
+            raise ValueError("each output needs its own sha256")
+        if x in ins:
+            raise ValueError("an output cannot also be an input")
+        if i is not None and not INFOHASH_RE.match(i):
+            raise ValueError("bad infohash")
+        _opt_int(size)
+        seen.add(x)
+        outs.append({"x": x, "i": i, "size": size})
+    outs.sort(key=lambda o: o["x"])
+    if not tool or len(tool) > 100:
+        raise ValueError("tool needs a name of up to 100 characters")
+    if tool_x is not None and not HEX64.match(tool_x):
+        raise ValueError("tool_x must be 64 hex characters")
+    if data_origin not in DATA_ORIGINS:
+        raise ValueError(f"data_origin must be one of {DATA_ORIGINS}")
+    if isinstance(synthetic_depth, bool) or not isinstance(synthetic_depth, int) or not 0 <= synthetic_depth <= MAX_SYNTHETIC_DEPTH:
+        raise ValueError(f"synthetic_depth must be 0 to {MAX_SYNTHETIC_DEPTH}")
+    if len(_dump(args)) > MAX_ARGS_BYTES:
+        raise ValueError(f"args are over {MAX_ARGS_BYTES} bytes")
+    lic_in = {x: str(v)[:100] for x, v in (licences.get("inputs") or {}).items() if x in ins}
+    body = {"v": 1, "inputs": [{"x": x} for x in ins], "outputs": outs,
+            "recipe": {"tool": tool, "tool_x": tool_x, "args": args}, "data_origin": data_origin,
+            "synthetic_depth": synthetic_depth, "licences": {"inputs": lic_in, "output": str(licences.get("output", ""))[:100]}}
+    tags = [["x", x, "input"] for x in ins] + [["x", o["x"], "output"] for o in outs]
+    tags += [["i", o["i"]] for o in outs if o["i"]]
+    return sign_event(secret, DERIVATION, tags, _dump(body), _now(created_at))
 
 
 def build_attestation(secret: bytes, claim: str, subject_kind: str, subject: str, *, ok: bool | None = None,
@@ -299,6 +365,8 @@ def parse_event(ev: dict, check_sig: bool = True):
             _check_tag(ev, "claim", claim)
             return Attestation(eid, pub, ts, claim, sk, sv, ok, match, str(res.get("detail", ""))[:500],
                                str(meth.get("tool", ""))[:100], tool_x, CLAIM_CLASS[claim])
+        if kind == DERIVATION:
+            return _parse_derivation(ev, body, eid, pub, ts)
         tk = body.get("target_kind")
         if tk not in TARGET_KINDS:
             raise ValueError("bad target_kind")
@@ -318,6 +386,51 @@ def parse_event(ev: dict, check_sig: bool = True):
         raise
     except (KeyError, TypeError, ValueError, AttributeError) as e:
         raise EventInvalid(f"malformed: {type(e).__name__}: {e}") from e
+
+
+def _parse_derivation(ev: dict, body: dict, eid: str, pub: str, ts: int) -> Derivation:
+    ins = body["inputs"]
+    outs = body["outputs"]
+    if not (isinstance(ins, list) and isinstance(outs, list) and 1 <= len(ins) <= MAX_DERIVATION_REFS
+            and 1 <= len(outs) <= MAX_DERIVATION_REFS):
+        raise ValueError("bad inputs or outputs")
+    in_x = [i["x"] for i in ins]
+    out_rows = []
+    for o in outs:
+        x, i, size = o["x"], o.get("i"), _opt_int(o.get("size"))
+        if i is not None and not (isinstance(i, str) and INFOHASH_RE.match(i)):
+            raise ValueError("bad infohash")
+        out_rows.append((x, i, size))
+    out_x = [r[0] for r in out_rows]
+    if not all(isinstance(x, str) and HEX64.match(x) for x in in_x + out_x):
+        raise ValueError("bad sha256")
+    if len(set(in_x)) != len(in_x) or len(set(out_x)) != len(out_x) or set(in_x) & set(out_x):
+        raise ValueError("inputs and outputs must be distinct")
+    rec = body["recipe"]
+    tool, tool_x, args = rec["tool"], rec.get("tool_x"), rec.get("args") or {}
+    if not isinstance(tool, str) or not 0 < len(tool) <= 100:
+        raise ValueError("bad tool")
+    if tool_x is not None and not (isinstance(tool_x, str) and HEX64.match(tool_x)):
+        raise ValueError("bad tool_x")
+    if not isinstance(args, dict) or len(_dump(args)) > MAX_ARGS_BYTES:
+        raise ValueError("bad args")
+    origin, depth = body["data_origin"], body["synthetic_depth"]
+    if origin not in DATA_ORIGINS:
+        raise ValueError("bad data_origin")
+    if isinstance(depth, bool) or not isinstance(depth, int) or not 0 <= depth <= MAX_SYNTHETIC_DEPTH:
+        raise ValueError("bad synthetic_depth")
+    lic = body.get("licences") or {}
+    lic_in = lic.get("inputs") or {}
+    if not isinstance(lic_in, dict) or not all(k in in_x and isinstance(v, str) for k, v in lic_in.items()):
+        raise ValueError("bad licences")
+    for x in in_x:
+        _check_tag(ev, "x", x)
+    for x, i, _ in out_rows:
+        _check_tag(ev, "x", x)
+        if i:
+            _check_tag(ev, "i", i)
+    return Derivation(eid, pub, ts, tuple(sorted(in_x)), tuple(sorted(out_rows, key=lambda r: r[0])), tool, tool_x, args,
+                      origin, depth, {"inputs": {k: v[:100] for k, v in lic_in.items()}, "output": str(lic.get("output", ""))[:100]})
 
 
 def _check_tag(ev: dict, name: str, value: str) -> None:

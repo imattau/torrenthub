@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -47,6 +47,20 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--reason", default="")
     sp.add_argument("--taint", action="store_true", help="things derived from a revoked blob are affected too")
     sp.add_argument("--successor", help="with --kind key: rotate to this key, which inherits the old key's incoming trust")
+
+    sp = sub.add_parser("derive", help="say that some blobs were made from others by a tool (a claim, class S unless the tool is on a trusted list)")
+    _key_args(sp)
+    sp.add_argument("--input", action="append", required=True, metavar="SHA256")
+    sp.add_argument("--output", action="append", required=True, metavar="SHA256[:SIZE[:INFOHASH]]")
+    sp.add_argument("--tool", required=True, help="tool name and version, for example safetensors-bf16@1")
+    sp.add_argument("--tool-x", help="sha256 of the tool or its container image")
+    sp.add_argument("--args", default="{}", help="JSON object of the tool's arguments")
+    sp.add_argument("--origin", default="unknown", choices=["human", "synthetic", "mixed", "unknown"])
+    sp.add_argument("--depth", type=int, default=0, help="generations of synthetic data behind the output")
+    sp.add_argument("--licence-out", default="")
+
+    sp = sub.add_parser("lineage", help="what trusted derivation events say about a blob (from THUB_ROOTS)")
+    sp.add_argument("sha256")
 
     sp = sub.add_parser("events-add", help="check an event file and add it to this gateway's event store")
     sp.add_argument("file")
@@ -120,7 +134,7 @@ def _emit(ev: dict, out: str | None) -> None:
 def run_event_command(args, settings, p) -> None:
     from .admission import Admission
     from .eventstore import EventStore
-    from .events import build_delegation, build_endorsement, build_identity, build_revocation
+    from .events import build_delegation, build_derivation, build_endorsement, build_identity, build_revocation
     from .signing import parse_pubkey
 
     def key(v):
@@ -140,6 +154,15 @@ def run_event_command(args, settings, p) -> None:
         elif c == "endorse":
             exp = int(time.time()) + args.expires_in if args.expires_in else None
             _emit(build_endorsement(_secret(args, p), key(args.subject), args.scope, args.weight, delegable=args.delegable, expires=exp), args.out)
+        elif c == "derive":
+            outs = []
+            for o in args.output:
+                x, _, rest = o.partition(":")
+                size, _, ih = rest.partition(":")
+                outs.append({"x": x, "size": int(size) if size else None, "i": ih or None})
+            _emit(build_derivation(_secret(args, p), args.input, outs, args.tool, tool_x=args.tool_x, args=json.loads(args.args),
+                                   data_origin=args.origin, synthetic_depth=args.depth,
+                                   licences={"output": args.licence_out}), args.out)
         elif c == "revoke":
             target = key(args.target) if args.kind == "key" else args.target
             succ = key(args.successor) if args.successor else None
@@ -208,7 +231,7 @@ def run_event_command(args, settings, p) -> None:
                     if out:
                         deliver([out])
             print(json.dumps(tally))
-        elif c in ("events-add", "events-pull", "events-sync", "events", "trust", "verdict"):
+        elif c in ("events-add", "events-pull", "events-sync", "events", "trust", "verdict", "lineage"):
             store = EventStore(settings.data_dir)
             adm = Admission(store, settings.roots, hops=settings.trust_hops)
             if c == "events-add":
@@ -236,6 +259,15 @@ def run_event_command(args, settings, p) -> None:
 
                 kinds = [int(k) for k in args.kinds.split(",") if k]
                 print(json.dumps(sync(adm, args.url, kinds, pull=not args.push_only, push=not args.pull_only)))
+            elif c == "lineage":
+                g = adm.graph()
+                mt = 0.0
+                print(json.dumps({"x": args.sha256, "status": g.blob_status(args.sha256), "synthetic_depth": g.synthetic_depth(args.sha256, mt),
+                                  "descends_from_revoked": g.tainted_descendants(mt).get(args.sha256),
+                                  "made_by": [{"event": d.id[:16], "issuer": d.issuer[:16], "tool": d.tool, "inputs": [i[:16] for i in d.inputs]}
+                                              for d in g.parents(args.sha256, mt)],
+                                  "used_by": [{"event": d.id[:16], "issuer": d.issuer[:16], "tool": d.tool, "outputs": [o[0][:16] for o in d.outputs]}
+                                              for d in g.children(args.sha256, mt)]}, indent=1))
             elif c == "verdict":
                 g = adm.graph()
                 v = g.verdict(args.sha256, args.claim, args.independent, args.min_trust)

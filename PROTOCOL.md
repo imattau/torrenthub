@@ -48,7 +48,7 @@ Common to all events: the NIP-01 layout already in `signing.py` (id, pubkey, cre
 | 36780 | `endorsement` | built |
 | 36781 | `revocation` | built |
 | 36782 | `attestation` | built |
-| 36783 | `derivation` | reserved, P3 |
+| 36783 | `derivation` | built |
 | 36784 | `request` | reserved, P5 |
 | 36785 | `claim` | reserved, P5 |
 | 36786 | `result` | reserved, P5 |
@@ -70,7 +70,7 @@ Issuer authorises a key to act for it. Fields: `subject` key, `scope` (a list su
 "I trust key K for these scopes." Fields: `subject` key, `scope` list, `weight` in (0, 1], `delegable` (may K's own endorsements count onward), `expires`. An endorsement is an opinion and is weighed, never obeyed. Different from delegation: delegation says K acts as me, endorsement says I think K is reliable.
 
 ### 3.5 `derivation`
-Outputs made from inputs. Fields: `inputs` (each with `x`), `outputs` (each with `x`, `i`, `size`), `recipe` (`tool`, `tool_x` hash of the tool or its container, `args`), `data_origin`, `synthetic_depth`, `licences`. Class D if and only if the consumer has the tool's hash on its list of tools it trusts to be bit exact. Otherwise class S.
+Outputs made from inputs. Fields: `inputs` (each with `x`), `outputs` (each with `x`, `i`, `size`), `recipe` (`tool`, `tool_x` hash of the tool or its container, `args`), `data_origin`, `synthetic_depth`, `licences`. Class D if and only if the consumer has the tool's hash on its list of tools it trusts to be bit exact. Otherwise class S. Built (section 14): a consumer believes a derivation's lineage only from keys it trusts for scope `derive`, because a false one could taint an innocent blob.
 
 ### 3.6 `attestation`
 A statement about a subject (`x` blob or `e` event). Claim types and classes:
@@ -94,7 +94,7 @@ Request: task type, inputs by hash, a spec hash, deadline, optional reward point
 
 ## 4. Policy
 
-A consumer's policy is a file. Rules say what must hold before a thing is used. The format is TOML, one file per gateway (`THUB_POLICY`, section 11 item 1), and the `[[file]]` rules for `require` (a claim, `independent`, `min_trust`), `deny` and `allow` are built (section 13). The other rule types below are design only. The rule types are:
+A consumer's policy is a file. Rules say what must hold before a thing is used. The format is TOML, one file per gateway (`THUB_POLICY`, section 11 item 1), and the `[[file]]` rules for `require` (a claim, `independent`, `min_trust`), `deny` and `allow` are built (section 13). A `[lineage]` table with `on_tainted`, `max_synthetic_depth`, `min_trust` and `trusted_tools` is also built (section 14). Of the rule types below, `max_age` is the only one still design only. The rule types are:
 
 - `root`: keys pinned with weight 1.
 - `require signed(root[, ...])` for a namespace, as `THUB_TRUST` does now, including delegation chains.
@@ -128,7 +128,7 @@ What this is not: PageRank or any score that more keys can inflate. That choice 
 
 ## 6. Verification and the three classes
 
-- **D, recompute.** The checker redoes the step and compares hashes. It works only for operations that are bit exact. I do not know yet which are: format conversion with no arithmetic probably is. Quantisation and merging may differ between CPUs and GPUs, and that has to be measured per tool before any tool is put on a trusted list.
+- **D, recompute.** The checker redoes the step and compares hashes. It works only for operations that are bit exact. First measurements are in section 14: an integer cast and a float reduction were bit exact everywhere tried, a float32 matrix product was not. Quantisation and merging may differ between CPUs and GPUs too, and that has to be measured per tool before any tool is put on a trusted list.
 - **R, re-run within tolerance.** Evals with a fixed code hash, data hash and seed. Different hardware can shift numbers slightly, so a replication states a tolerance.
 - **S, self-reported.** Recorded, shown, never relied on by default.
 
@@ -185,7 +185,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P0 (passed 2026-10-16: approved, decisions in `ARCHITECTURE.md` section 11) | Review this document. Assign kind numbers after rechecking the registry. Policy format decided (section 11). | You approve, open questions in section 11 answered |
 | P1 (built, section 12; the rules that need derivations or manifest v2 wait for P3 and P4) | Generalise to an event store and API. Identity, delegation, endorsement and revocation events. The trust evaluator and policy engine. CLI. Admission control. | The simulation tests in section 9 pass, including order independence and the sybil and collusion cases, with timings for a large event set |
 | P2 (built, section 13) | Attestations: `hash_verified` and `format_scan`, a verifier agent, replication events, `independent(n)`, a signer process, and the MCP write tools (read and download tools already exist, M0) | A verifier agent publishes, a consumer policy changes behaviour because of it, and a bad attestor is caught by replication |
-| P3 | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |
+| P3 (built, section 14; the gate is only partly met) | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |
 | P4 | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
 | P5 | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
 | P6 | Nostr relay adapter | Events round trip through a real relay, with size limits known |
@@ -262,3 +262,40 @@ Code: `verifier.py`, `policy.py`, `signer.py`, the attestation parts of `events.
 - The verifier needs the bytes. Unattested content is refused before it is fetched, so a verifier must get it elsewhere (its own gateway without a policy, or `torrenthub mirror`). That is a deliberate order of checks, and it means a new file waits for someone to attest it.
 - Everything ran on a fake origin on loopback. Nothing has been tried with real attestors, real models or real torch files.
 
+## 14. What is built (P3)
+
+Code: the `derivation` event in `events.py` (kind 36783), lineage in `trust.py` (`Graph.parents`, `children`, `ancestors`, `tainted_descendants`, `synthetic_depth`, `derivation_class`), the `[lineage]` table in `policy.py`, `torrenthub derive` and `torrenthub lineage`, `GET /api/thub/lineage/<sha256>`, and `validation/determinism.py`. Tests: `tests/test_lineage.py`, `tests/test_determinism.py`. Raw measurements: `validation/results/determinism-2026-10-16.jsonl`.
+
+**Built and tested**
+- The derivation event: inputs and outputs by sha256 (outputs may carry an infohash and size), a recipe (tool name, `tool_x` hash, arguments up to 2000 bytes), `data_origin`, `synthetic_depth` (0 to 64) and licences. Signed tags must match the content, and events can be found by any blob they mention.
+- Lineage counts only from keys that are roots or trusted for scope `derive`. A stranger's claim that an innocent blob came from a bad one cannot taint it (tested), and a stranger cannot lower a blob's synthetic depth.
+- Taint: a blob revoked with `taint` makes every descendant, through trusted derivations and across any number of steps, `descended`. Revocation without taint does not reach descendants. Cycles end. The answers do not depend on event order.
+- Synthetic depth is a lower bound: the largest depth a trusted derivation declares for a blob, or one more than an input's depth when the derivation's data is `synthetic` or `mixed`.
+- `[lineage]` in the policy file: `on_tainted = "refuse" | "warn"` (default refuse; warn serves the file with an `X-Thub-Warning` header), `max_synthetic_depth`, `min_trust` for `derive`, and `trusted_tools`. These run before the file rules, so no `allow` rule overrides a taint. Refusals use error codes `Tainted` and `SyntheticDepth`.
+- Class: a derivation is D for a gateway whose `trusted_tools` lists its `tool_x`, otherwise S. The lineage API shows each derivation's class.
+
+**Measured: is a tool bit exact across environments?** Three tools, one input (a 4 tensor float32 safetensors file, sha256 `a768f6fc98f9...`), 117 runs:
+
+| Tool | Result |
+|---|---|
+| `bf16_cast` (float32 to bfloat16, integer round to nearest even) | Bit exact in all 39 runs |
+| `rms_norm` (a float reduction) | Bit exact in all 39 runs |
+| `gram` (float32 `W @ W.T` through OpenBLAS) | 7 distinct outputs in 39 runs: not bit exact |
+
+The 39 runs per tool covered: this host (numpy 2.5.4 and 2.4.6), a Debian 12 VM with the host's CPU model (Python 3.11), a VM whose CPU is a Nehalem class model without AVX or FMA, OpenBLAS kernels forced to Prescott, Nehalem, Sandybridge, Haswell and Zen, and 1, 4 and 20 threads. What decided `gram`: the BLAS kernel (the Nehalem class VM, choosing its own kernel, matched the host forced to Nehalem, so forcing is a fair stand in), and the thread count, even on one machine with one kernel. Single threaded runs with the same kernel agreed between the host and the VM. Multi threaded runs did not, because the VM has 2 cores and the host 20. So `gram` can only be class D in an environment that pins the kernel and one thread, and I would not list it. `bf16_cast` and `rms_norm` have no such dependence in these runs. The harness checks `bf16_cast` against the definition (ties to even, NaN, infinity, overflow) and against an independent rounding of random values.
+
+**The P3 gate is only partly met.** It asks for bit exactness measured on at least two different machines. Everything here ran on one physical machine (a Core i5-14600K), with different operating system, Python and library builds, a different virtual CPU model and forced kernels. That is real evidence and it is not two machines: a different CPU vendor, a GPU, or a different BLAS build could still disagree. Until the harness has been run on a second physical machine, `bf16_cast` and `rms_norm` stay on no list, and every derivation is class S. To finish the gate, on the other machine:
+
+```
+python3 validation/determinism.py make-input input.safetensors
+python3 validation/determinism.py run bf16_cast input.safetensors out.safetensors >> mine.jsonl   # and rms_norm
+python3 validation/determinism.py compare validation/results/determinism-2026-10-16.jsonl mine.jsonl
+```
+
+`make-input` is seeded, so the input file should come out with the same sha256 (`a768f6fc...`). If it does not (a different numpy random generator), copy the input file from this repo's run instead. Then `BIT EXACT` for a tool on that line means it passed. The tool hash to list would be the sha256 of the exact `determinism.py` used (`0e907d9b...` for the file in this commit), since the tools share one file.
+
+**Not built**
+- Replication of derivations: a verifier that re-runs a class D tool on the inputs and signs match or mismatch against the derivation event. Without it, class D means "a consumer would accept a recomputation", and nobody has recomputed. `replication` attestations refer to attestation events only.
+- Licence checks (`licences` is recorded and shown, nothing acts on it), data origin checks beyond the depth cap, and `max_age` (P4).
+- Depth is only as good as the declared data: undeclared synthetic data is invisible, and a derivation nobody trusted never reaches the graph. Hiding lineage hides taint.
+- The measured tools run on CPUs and numpy only. GPUs, quantisers such as GGUF and GPTQ, and merging tools are untested.

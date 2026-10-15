@@ -21,8 +21,8 @@ import fnmatch
 from dataclasses import dataclass, replace
 
 from .events import (
-    DELEGATION, ENDORSEMENT, IDENTITY, REVOCATION, Attestation, Delegation, Endorsement, EventInvalid, Identity, Revocation,
-    parse_event,
+    DELEGATION, ENDORSEMENT, IDENTITY, REVOCATION, Attestation, Delegation, Derivation, Endorsement, EventInvalid, Identity,
+    Revocation, parse_event,
 )
 
 DEFAULT_HOPS = 3
@@ -30,6 +30,8 @@ MAX_DELEGATION_DEPTH = 4
 MAX_ROTATIONS = 8  # longest chain of key rotations followed
 INDEPENDENT_BUDGET = 200_000  # search steps before independent_ex gives up on exactness
 MAX_PATH_SETS = 256  # distinct intermediate-key sets kept per key
+DERIVE_SCOPE = "derive"  # a key trusted for this has its derivation (lineage) claims believed
+MAX_LINEAGE_DEPTH = 64  # longest chain of derivations followed
 
 
 def covers(patterns, scope: str | None) -> bool:
@@ -99,6 +101,8 @@ class Graph:
             self._dels.setdefault(d.issuer, []).append(d)
         self._cache: dict = {}
         self._rev = None
+        self.derivations = [d for d in ids.values() if isinstance(d, Derivation)
+                            and d.id not in self.revoked_events and d.issuer not in self.revoked_keys]
         self.attestations = [a for a in ids.values() if isinstance(a, Attestation)
                              and a.id not in self.revoked_events and a.issuer not in self.revoked_keys]
         self._by_subject: dict[tuple, list[Attestation]] = {}
@@ -437,10 +441,110 @@ class Graph:
     # --------------------------------------------------------------- revoked
     def blob_status(self, x: str) -> str | None:
         """None if nothing trusted revoked this blob, "revoked" if it was, "tainted" if it was
-        revoked with taint (so things derived from it are affected too)."""
-        if x not in self.revoked_x:
-            return None
-        return "tainted" if self.revoked_x[x] else "revoked"
+        revoked with taint (so things derived from it are affected too), "descended" if it was
+        not revoked but a trusted derivation says it came from a blob that was revoked with taint."""
+        if x in self.revoked_x:
+            return "tainted" if self.revoked_x[x] else "revoked"
+        if x in self.tainted_descendants():
+            return "descended"
+        return None
+
+    # --------------------------------------------------------------- lineage
+    def trusted_derivations(self, min_trust: float = 0.0) -> list[Derivation]:
+        """Derivations whose issuer is a root or is trusted for scope "derive". Anyone can publish
+        a derivation event, and a false one could taint an innocent blob or hide a bad ancestor,
+        so lineage counts only from keys this consumer already trusts for it."""
+        ck = ("derivs", min_trust)
+        if ck not in self._cache:
+            ok: dict[str, bool] = {}
+            out = []
+            for d in sorted(self.derivations, key=lambda d: (d.created_at, d.id)):
+                if d.issuer not in ok:
+                    ok[d.issuer] = d.issuer in self.roots or self.trust(d.issuer, DERIVE_SCOPE).value > min_trust
+                if ok[d.issuer]:
+                    out.append(d)
+            self._cache[ck] = out
+        return self._cache[ck]
+
+    def _lineage_index(self, min_trust: float = 0.0):
+        ck = ("lineage", min_trust)
+        if ck not in self._cache:
+            by_out: dict[str, list[Derivation]] = {}
+            by_in: dict[str, list[Derivation]] = {}
+            for d in self.trusted_derivations(min_trust):
+                for x, _, _ in d.outputs:
+                    by_out.setdefault(x, []).append(d)
+                for x in d.inputs:
+                    by_in.setdefault(x, []).append(d)
+            self._cache[ck] = (by_out, by_in)
+        return self._cache[ck]
+
+    def parents(self, x: str, min_trust: float = 0.0) -> list[Derivation]:
+        """Trusted derivations that list `x` as an output."""
+        return list(self._lineage_index(min_trust)[0].get(x, ()))
+
+    def children(self, x: str, min_trust: float = 0.0) -> list[Derivation]:
+        """Trusted derivations that list `x` as an input."""
+        return list(self._lineage_index(min_trust)[1].get(x, ()))
+
+    def ancestors(self, x: str, min_trust: float = 0.0) -> set[str]:
+        by_out = self._lineage_index(min_trust)[0]
+        seen: set[str] = set()
+        todo = [x]
+        while todo:
+            for d in by_out.get(todo.pop(), ()):
+                for i in d.inputs:
+                    if i not in seen and i != x:
+                        seen.add(i)
+                        todo.append(i)
+        return seen
+
+    def tainted_descendants(self, min_trust: float = 0.0) -> dict[str, str]:
+        """Every blob that trusted lineage says descends from a blob revoked with taint, mapped to
+        the revoked blob it descends from (one of them, the lowest hash, if several)."""
+        ck = ("tainted", min_trust)
+        if ck in self._cache:
+            return self._cache[ck]
+        by_in = self._lineage_index(min_trust)[1]
+        out: dict[str, str] = {}
+        for src in sorted(x for x, t in self.revoked_x.items() if t):
+            todo = [src]
+            seen = {src}
+            while todo:
+                for d in by_in.get(todo.pop(), ()):
+                    for x, _, _ in d.outputs:
+                        if x not in seen:
+                            seen.add(x)
+                            todo.append(x)
+                            if x not in self.revoked_x:
+                                out.setdefault(x, src)
+        self._cache[ck] = out
+        return out
+
+    def synthetic_depth(self, x: str, min_trust: float = 0.0) -> int:
+        """A lower bound on how many generations of synthetic data lie behind `x`: the largest
+        depth any trusted derivation declares for it, or one more than an input's depth when the
+        derivation says its data is synthetic or mixed. Undeclared synthetic data cannot be seen."""
+        by_out = self._lineage_index(min_trust)[0]
+        memo: dict[str, int] = {}
+
+        def depth(blob: str, trail: frozenset) -> int:
+            if blob in memo:
+                return memo[blob]
+            if blob in trail or len(trail) >= MAX_LINEAGE_DEPTH:
+                return 0
+            best = 0
+            for d in by_out.get(blob, ()):
+                inner = max((depth(i, trail | {blob}) for i in d.inputs), default=0)
+                best = max(best, d.synthetic_depth, inner + (1 if d.data_origin in ("synthetic", "mixed") else 0))
+            memo[blob] = best
+            return best
+
+        return depth(x, frozenset())
+
+    def derivation_class(self, d: Derivation, trusted_tools) -> str:
+        """D if this consumer lists the tool's hash as bit exact, otherwise S (self reported)."""
+        return "D" if d.tool_x and d.tool_x in set(trusted_tools) else "S"
 
     # ----------------------------------------------------------- attestations
     def refuted_attestors(self) -> dict[str, str]:

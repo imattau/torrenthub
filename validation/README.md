@@ -122,3 +122,7 @@ Run 2026-10-15/16 from one machine. Steps 1 and 2 were first run over a congeste
 **Lessons from the VM setup**, in case it is rebuilt: a cloud-init seed on a SATA CD-ROM made the Debian 12 cloud image hang early in boot with no network. A virtio-SCSI CD-ROM works (that is how the nostrhost VMs are built). The VMs were `thub-hub` (192.168.122.25) and `thub-agent` (192.168.122.222) with files in `~/torrenthub-vms`. `torrenthub mirror` seeds only while its own process lives, so mirror first and then start `serve`, which re-seeds stored blobs on startup.
 
 Not covered: a recently created repo (the probe's own advice), gated repos, sharded weights, anything over 1 GB, peers on separate real networks.
+
+## Determinism (P3)
+
+`determinism.py` checks whether a tool gives the same bytes in different environments, which is what decides whether a derivation can ever be class D. Results from this host and two VMs are in `results/determinism-2026-10-16.jsonl`, and the reading of them, with the one gate still open (a second physical machine), is in `PROTOCOL.md` section 14. In short: an integer cast and a float reduction were bit exact in 39 of 39 runs each, a float32 matrix product was not (7 different outputs; the BLAS kernel and the thread count both change the bytes).

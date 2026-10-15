@@ -381,6 +381,24 @@ def create_app(
                            include_quarantine=q.get("quarantine") == "1")
         return JSONResponse({"events": out}, headers={"X-Mirror": "torrenthub"})
 
+    @app.get("/api/thub/lineage/{sha256}")
+    async def lineage_of(sha256: str):
+        """Where a blob came from and what came from it, as far as keys this gateway trusts for
+        "derive" say, with each derivation's class under this gateway's trusted tools list."""
+        g = admission.graph()
+        lin = getattr(policy_rules, "lineage", None)
+        tools = lin.trusted_tools if lin else ()
+        mt = lin.min_trust if lin else 0.0
+
+        def row(d):
+            return {"event": d.id, "issuer": d.issuer, "tool": d.tool, "tool_x": d.tool_x, "class": g.derivation_class(d, tools),
+                    "inputs": list(d.inputs), "outputs": [o[0] for o in d.outputs], "data_origin": d.data_origin,
+                    "synthetic_depth": d.synthetic_depth, "licences": d.licences}
+
+        return {"x": sha256, "status": g.blob_status(sha256), "synthetic_depth": g.synthetic_depth(sha256, mt),
+                "descends_from_revoked": g.tainted_descendants(mt).get(sha256),
+                "made_by": [row(d) for d in g.parents(sha256, mt)], "used_by": [row(d) for d in g.children(sha256, mt)]}
+
     @app.get("/api/thub/trust/{pubkey}")
     async def trust_of(pubkey: str, scope: str | None = None):
         """How much this gateway trusts a key, from its own roots, with the path that explains it."""
@@ -511,6 +529,9 @@ def create_app(
             "ETag": f'"{rec.etag}"',
             "Content-Disposition": f'inline; filename="{Path(filename).name}"',
         }
+        if dec.notes:
+            headers["X-Thub-Warning"] = "; ".join(dec.notes)[:500]
+            metrics.inc("thub_policy_total", result="warned")
         if dec.attested_by:
             headers["X-Thub-Attested-By"] = str(len(dec.attested_by))
             metrics.inc("thub_policy_total", result="attested")
