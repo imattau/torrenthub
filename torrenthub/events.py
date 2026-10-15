@@ -12,6 +12,7 @@ whether anyone should believe it. That is trust.py.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -184,6 +185,19 @@ class Revocation:
     successor: str | None = None  # rotation: the key that inherits the revoked key's standing
 
 
+def _signed(secret: bytes, kind: int, tags: list, content: str, created_at: int) -> dict:
+    """Sign an event, adding a `d` tag made from its content unless it has one.
+
+    Every kind here is in NIP-01's addressable range (30000 to 39999), where a relay keeps only the
+    latest event per kind, key and `d` tag, and a missing `d` counts as the empty string. Without
+    this, a relay would keep one endorsement per key, one attestation per key, and so on. With it,
+    events with different content never share an address, and identical content (the same meaning)
+    does. Nothing here reads the tag, so events from before this change still parse."""
+    if not any(len(t) >= 2 and t[0] == "d" for t in tags):
+        tags = [*tags, ["d", hashlib.sha256(content.encode()).hexdigest()[:32]]]
+    return sign_event(secret, kind, tags, content, created_at)
+
+
 def _dump(body: dict) -> str:
     return json.dumps(body, separators=(",", ":"), sort_keys=True, ensure_ascii=True)
 
@@ -217,7 +231,7 @@ def build_identity(secret: bytes, label: str = "unspecified", recovery: str | No
         raise ValueError(f"label must be one of {LABELS}")
     body = {"v": 1, "label": label, "recovery": _key(recovery) if recovery else None, "note": note[:500]}
     tags = [["e", supersedes, "supersedes"]] if supersedes else []
-    return sign_event(secret, IDENTITY, tags, _dump(body), _now(created_at))
+    return _signed(secret, IDENTITY, tags, _dump(body), _now(created_at))
 
 
 def build_delegation(secret: bytes, subject: str, scope, *, not_before: int = 0, expires: int | None = None,
@@ -228,7 +242,7 @@ def build_delegation(secret: bytes, subject: str, scope, *, not_before: int = 0,
         "expires": None if expires is None else int(expires), "redelegable": bool(redelegable),
         "limits": {"max_events_per_day": max_events_per_day, "max_bytes_per_day": max_bytes_per_day},
     }
-    return sign_event(secret, DELEGATION, [["p", subject]], _dump(body), _now(created_at))
+    return _signed(secret, DELEGATION, [["p", subject]], _dump(body), _now(created_at))
 
 
 def build_endorsement(secret: bytes, subject: str, scope, weight: float, *, delegable: bool = False,
@@ -239,7 +253,7 @@ def build_endorsement(secret: bytes, subject: str, scope, weight: float, *, dele
         "v": 1, "subject": _key(subject), "scope": _scopes(scope), "weight": float(weight),
         "delegable": bool(delegable), "expires": None if expires is None else int(expires),
     }
-    return sign_event(secret, ENDORSEMENT, [["p", subject]], _dump(body), _now(created_at))
+    return _signed(secret, ENDORSEMENT, [["p", subject]], _dump(body), _now(created_at))
 
 
 def build_revocation(secret: bytes, target_kind: str, target: str, reason: str = "", severity: str = "normal",
@@ -260,7 +274,7 @@ def build_revocation(secret: bytes, target_kind: str, target: str, reason: str =
             raise ValueError("successor must be a different key of 64 hex characters")
         body["successor"] = successor
         tags.append(["p", successor, "successor"])
-    return sign_event(secret, REVOCATION, tags, _dump(body), _now(created_at))
+    return _signed(secret, REVOCATION, tags, _dump(body), _now(created_at))
 
 
 def build_derivation(secret: bytes, inputs: list[str], outputs: list[dict], tool: str, *, tool_x: str | None = None,
@@ -303,7 +317,7 @@ def build_derivation(secret: bytes, inputs: list[str], outputs: list[dict], tool
             "synthetic_depth": synthetic_depth, "licences": {"inputs": lic_in, "output": str(licences.get("output", ""))[:100]}}
     tags = [["x", x, "input"] for x in ins] + [["x", o["x"], "output"] for o in outs]
     tags += [["i", o["i"]] for o in outs if o["i"]]
-    return sign_event(secret, DERIVATION, tags, _dump(body), _now(created_at))
+    return _signed(secret, DERIVATION, tags, _dump(body), _now(created_at))
 
 
 def build_request(secret: bytes, task: str, inputs: list[str], *, args: dict | None = None, spec_x: str | None = None,
@@ -328,7 +342,7 @@ def build_request(secret: bytes, task: str, inputs: list[str], *, args: dict | N
     body = {"v": 1, "task": task, "inputs": [{"x": x} for x in ins], "spec": {"args": args, "spec_x": spec_x},
             "deadline": deadline, "reward": reward, "want": want}
     tags = [["task", task]] + [["x", x, "input"] for x in ins]
-    return sign_event(secret, REQUEST, tags, _dump(body), ts)
+    return _signed(secret, REQUEST, tags, _dump(body), ts)
 
 
 def build_claim(secret: bytes, request_id: str, *, expires: int, created_at: int | None = None) -> dict:
@@ -337,7 +351,7 @@ def build_claim(secret: bytes, request_id: str, *, expires: int, created_at: int
         raise ValueError("request id must be 64 hex characters")
     if isinstance(expires, bool) or not isinstance(expires, int) or expires <= ts:
         raise ValueError("expires must be after the claim")
-    return sign_event(secret, CLAIM, [["e", request_id, "request"]], _dump({"v": 1, "request": request_id, "expires": expires}), ts)
+    return _signed(secret, CLAIM, [["e", request_id, "request"]], _dump({"v": 1, "request": request_id, "expires": expires}), ts)
 
 
 def build_result(secret: bytes, request_id: str, status: str = "done", *, attestations: list[str] | None = None,
@@ -364,7 +378,7 @@ def build_result(secret: bytes, request_id: str, status: str = "done", *, attest
     tags = [["e", request_id, "request"]] + [["e", a, "attestation"] for a in atts] + [["x", o["x"], "output"] for o in outs]
     if derivation:
         tags.append(["e", derivation, "derivation"])
-    return sign_event(secret, RESULT, tags, _dump(body), _now(created_at))
+    return _signed(secret, RESULT, tags, _dump(body), _now(created_at))
 
 
 def build_attestation(secret: bytes, claim: str, subject_kind: str, subject: str, *, ok: bool | None = None,
@@ -384,7 +398,7 @@ def build_attestation(secret: bytes, claim: str, subject_kind: str, subject: str
         result = {"ok": ok, "detail": detail[:500]}
     body = {"v": 1, "claim": claim, "subject": {subject_kind: subject}, "result": result,
             "method": {"tool": tool[:100], "tool_x": tool_x}, "evidence": evidence}
-    return sign_event(secret, ATTESTATION, [[subject_kind, subject], ["claim", claim]], _dump(body), _now(created_at))
+    return _signed(secret, ATTESTATION, [[subject_kind, subject], ["claim", claim]], _dump(body), _now(created_at))
 
 
 # ------------------------------------------------------------------- parsing

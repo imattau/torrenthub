@@ -135,3 +135,7 @@ On the VMs: a publisher with every inbound packet dropped (the hub could not ope
 
 Hub and one worker on two VMs, the requester and a second worker on this host. `hash_verified` of the 954 MB published model by one worker was accepted in 11 s; `format_scan` of the same file by two independent workers in 10 s; a requester no one had endorsed was refused. Trust was set up beforehand by an operator key. Details in `PROTOCOL.md` section 16.
 
+## Nostr relays (P6)
+
+Against a local strfry 1.1.3 (the software behind several large public relays) and nak's test relay: every event kind round-trips; strfry collapses events with no `d` tag (so every event now carries one); strfry's NIP-11 publishes a 128 KiB message limit but refuses any single event over about 64 KiB. Raw results are in `results/`. Nothing was sent to a public relay. Details in `PROTOCOL.md` section 17. The strfry tests are opt in: `THUB_STRFRY_URL=ws://127.0.0.1:7777 python -m pytest tests/test_relay_strfry.py` (the file explains how to start strfry and why its default write policy must be switched off).
+

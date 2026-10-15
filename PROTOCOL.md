@@ -55,6 +55,8 @@ Common to all events: the NIP-01 layout already in `signing.py` (id, pubkey, cre
 
 A change to an event's fields that old readers cannot parse bumps its content `v` field. It does not get a new kind.
 
+Every event built here carries a `d` tag made from its content (`d` = the first 32 hex characters of the sha256 of the content), unless it has one already (manifests do: `repo@commit`). This is not cosmetic. These kinds are in NIP-01's addressable range, where a relay keeps only the latest event per kind, key and `d` tag and treats a missing `d` as empty. Without the tag a relay holds one endorsement per key, one attestation per key, one request per key. Measured against strfry 1.1.3, which collapsed three tagless endorsements from one key into one and kept all three tagged ones (section 17). Events from before the change still parse and verify; they just must not be sent to a relay.
+
 References to content use the tag names NIP-94 (file metadata) already uses, so existing tools can read them: `x` is a sha256 of a file, `i` is a torrent infohash, `magnet` is an optional magnet URI. References to other events use `e`. `content` is ASCII JSON with a version field, as the manifest already is.
 
 ### 3.1 `identity`
@@ -144,7 +146,7 @@ A hub or agent can run a **verifier**: it watches for new blobs and attestations
 
 ## 8. Transport
 
-HTTP hubs first. A Nostr relay adapter later: events are already in the relay format. I have not checked relays' event size limits, which is why item 14 above moves large tables into blobs. Where it fits, align with existing NIPs and do not reinvent them. From the NIPs README: NIP-94 gives the `x`, `i` and `magnet` tags. NIP-32 labels target events, people and topics, not blob hashes, so it is not a direct fit for attestations. NIP-85 shows the pattern of delegating trust computation to declared providers, but its kinds are for social metrics. NIP-13 proof of work is an optional extra for admission. NIP-26 delegated signing and NIP-90 data vending machines are marked unrecommended there.
+HTTP hubs first, and a Nostr relay adapter now (built, section 17): events are already in the relay format. Relays' real limits are measured in section 17, which is why item 14 above moves large tables into blobs. Where it fits, align with existing NIPs and do not reinvent them. From the NIPs README: NIP-94 gives the `x`, `i` and `magnet` tags. NIP-32 labels target events, people and topics, not blob hashes, so it is not a direct fit for attestations. NIP-85 shows the pattern of delegating trust computation to declared providers, but its kinds are for social metrics. NIP-13 proof of work is an optional extra for admission. NIP-26 delegated signing and NIP-90 data vending machines are marked unrecommended there.
 
 ## 8a. Agent interface (MCP is optional)
 
@@ -188,7 +190,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P3 (built, section 14; the gate is only partly met) | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |
 | P4 (built, section 15; gate met in a simulation of NAT, not behind a real router) | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
 | P5 (built, section 16; gate met on two machines, with trust set up beforehand) | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
-| P6 | Nostr relay adapter | Events round trip through a real relay, with size limits known |
+| P6 (built, section 17; gate met against a local strfry and a lenient relay, not a public one) | Nostr relay adapter | Events round trip through a real relay, with size limits known |
 
 Public service questions (who pays for the first copy, takedown and abuse policy, IP exposure) stay open in `ARCHITECTURE.md` and are not answered by any phase above.
 
@@ -359,4 +361,47 @@ The gate asks for two agents to complete a request cycle with no human step. Not
 - `disputed` is reported and left to the requester. The remedy this design offers is replication by a third trusted party, which a requester must ask for with another request.
 - Request spam is limited only by admission control (a stranger's requests are quarantined; a member's are rate limited per key).
 - A requester and the hub may disagree about a state, because the hub judges by its roots and the requester by its own.
+
+## 17. What is built (P6)
+
+Code: `relay.py` (the NIP-01 client, NIP-11 limits, NIP-42 answers, the probe), `relay_sync.py` (push, pull, pulling by following trust, manifests), the commands `relay-info`, `relay-check`, `relay-push` and `relay-pull`, and the `d` tag in `events.py`. Install the extra with `pip install 'torrenthub[relay]'` (it adds `websockets`). Tests: `tests/test_relay.py` (a strict fake relay, `tests/fake_relay.py`), `tests/test_relay_nak.py` (the `nak serve` relay), and `tests/test_relay_strfry.py` (opt in with `THUB_STRFRY_URL`). Raw measurements: `validation/results/strfry-1.1.3-probe-2026-10-16.json` and `nip11-public-relays-2026-10-16.json`.
+
+**What it does**
+- `relay-push` sends the main-tier events of a local store (and, with `--manifest-repo`, signed manifests) to a relay, waits for each OK, retries a "rate-limited" answer with backoff, and answers a NIP-42 `AUTH` challenge when given a key. Each event is first checked against the relay's published limits and a default 64 KiB event cap (below), so one that cannot fit is reported and skipped.
+- `relay-pull` reads events and gives each to the same admission as an event from a hub: the signature is checked again and a stranger's event is quarantined. **The relay is trusted for nothing.** `--follow` asks only for keys the store's own roots already trust, and widens as trust grows (round one: the roots; round two: whom they endorsed; and so on). In a test with a stranger's events sitting on the relay, they were never requested. `--manifest-signer KEY --manifest-repo REPO` takes manifests from a named signer only.
+- `relay-info` prints a relay's NIP-11 limits. `relay-check` sends probe events, signed by a throwaway key and tagged `t=torrenthub-probe`, to find what a relay really does, then asks it to delete them (NIP-09). Use it only on a relay you run.
+
+**What was measured**
+
+*The `d` tag.* Against strfry 1.1.3 (the relay software behind relay.damus.io, relay.primal.net and offchain.pub): three endorsements from one key with no `d` tag, strfry kept one; three with our content-derived `d` tag, it kept all three. `nak serve` (an in-memory relay on khatru) kept all of both, so a lenient relay would have hidden the problem. Every event kind (36777 to 36786) was accepted by both.
+
+*Size limits, strfry 1.1.3 with its default configuration.* NIP-11 publishes `max_message_length` 131072 and nothing about event size. The probe found it takes a single event of at most about 64 KiB (65,541 bytes on the wire accepted, 69,646 refused with `invalid: event too large`) and up to somewhere between 1,026 and 4,098 tags (refused at 4,098 with `invalid: too many tags`). So the published limit is not the real one. The adapter's default guard skips events over 65,536 bytes; `--max-event-bytes 0` turns it off, and with it off strfry's refusal is reported (`{"invalid": 1}`), not hidden. A median OK took 3 ms on localhost.
+
+*Published limits of public relays* (NIP-11 documents only; nothing was sent to them): relay.damus.io 1,000,000 bytes per message; relay.primal.net 1,000,000; relay.snort.social 524,288; nostr.wine 524,288, 4,000 tags, **payment required and writes restricted**; offchain.pub 131,072; nos.lol, relay.nostr.band and relay.nostr.bg publish no limits at all. Whether any of them takes these kinds was not tested.
+
+*Our events against those limits* (wire size of `["EVENT", ...]`; typical, then the largest the parsers allow):
+
+| Event | Typical | Largest legal |
+|---|---|---|
+| identity, revocation, attestation, claim | 0.5 to 0.7 KB | 1.0 to 1.3 KB |
+| endorsement, delegation, request | 0.6 to 0.7 KB | 4.3 to 5.2 KB |
+| result | 0.8 KB | 10.9 KB |
+| derivation | 1.0 KB | 19.3 KB |
+| manifest v2, file table in a blob | 0.8 KB at any repo size | n/a |
+| manifest v2, 200 rows inline | 25 KB | n/a |
+| manifest v1, 1,000 rows inline | 125 KB | n/a |
+
+Every participant event fits under 64 KiB with room to spare. Manifests are the exception, and that is what `files_x` is for: a v1 manifest with 700 rows is over the 64 KiB cap that strfry enforces but under the 128 KiB it publishes, and the guard catches exactly that case.
+
+*Round trips.* Every kind round-tripped through strfry into a second store (13 events, then again with all duplicates reported as such, then a second pull finding nothing new), manifests round-tripped with only the named signer taken, and `nak req` read back from strfry the same events we sent. The same held for `nak serve` and for the strict fake relay.
+
+**How strfry was run, and why that matters.** The `docker.io/dockurr/strfry` image (215 MB) ships a configuration whose write policy rejects every key but a whitelist, which is not how open public relays behave. For these tests that plugin was switched off (`writePolicy.plugin = ""`) and every limit left at strfry's default. A public relay's own policy, rate limits and spam filters are unknown and may differ.
+
+**Not built, or limited**
+- Nothing was sent to a public relay, so whether relay.damus.io or any other accepts these kinds, or throttles them, is unknown. A relay that restricts writes or requires payment (nostr.wine does) will refuse unknown keys.
+- No live subscription: a pull reads stored events and stops at EOSE. There is no follow-the-relay daemon and no background sync in the gateway; run the commands from a timer.
+- NIP-42 `AUTH` was tested against the fake relay only. Proof of work (NIP-13) is not mined: a relay demanding it is reported as unfit. Relay discovery (NIP-65), paying relays and deletion of real events (NIP-09 is used only to clean up probes) are not built.
+- Events stay valid forever on a relay that never deletes them. A revocation reaches a consumer only if the consumer asks a relay that holds it, which is the same withholding problem as with hubs.
+- Pagination assumes a relay honours `until` and a `limit` up to its own cap; more than a page of events in one second from one key would stall the walk.
+- Throughput and behaviour under load were not measured.
 

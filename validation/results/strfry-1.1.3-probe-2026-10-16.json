@@ -1,0 +1,50 @@
+{
+ "url": "ws://127.0.0.1:7777",
+ "nip11": {
+  "description": "This is a strfry instance.",
+  "limitation": {
+   "max_limit": 500,
+   "max_message_length": 131072,
+   "max_subscriptions": 200
+  },
+  "name": "strfry default",
+  "negentropy": 1,
+  "software": "git+https://github.com/hoytech/strfry.git",
+  "supported_nips": [
+   1,
+   2,
+   4,
+   9,
+   11,
+   28,
+   40,
+   45,
+   70,
+   77
+  ],
+  "version": "1.1.3"
+ },
+ "connected": true,
+ "kinds": {
+  "36777": "ok",
+  "36778": "ok",
+  "36779": "ok",
+  "36780": "ok",
+  "36781": "ok",
+  "36782": "ok",
+  "36783": "ok",
+  "36784": "ok",
+  "36785": "ok",
+  "36786": "ok"
+ },
+ "keeps_both_dless": false,
+ "keeps_both_with_d": true,
+ "max_event_bytes": 65541,
+ "first_refused_bytes": 69646,
+ "refusal": "invalid: event too large: 131067",
+ "max_tags": 1026,
+ "first_refused_tags": 4098,
+ "tag_refusal": "invalid: too many tags: 4098",
+ "rtt_ms": 3.0,
+ "notes": []
+}

@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "request", "requests", "work", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -99,6 +99,33 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--idle-exit", type=float, help="exit after this many seconds with nothing to do")
     sp.add_argument("--lease", type=float, default=300, help="seconds a claim lasts")
     sp.add_argument("--max-bytes", type=int, default=8 * 1024**3)
+
+    sp = sub.add_parser("relay-info", help="a Nostr relay's published limits (NIP-11), and which of our events would not fit")
+    sp.add_argument("relay", help="ws:// or wss:// address")
+
+    sp = sub.add_parser("relay-check", help="TEST a relay you run: send probe events to find its real limits and how it treats our event kinds")
+    sp.add_argument("relay")
+    sp.add_argument("--max-bytes", type=int, default=1024 * 1024, help="largest probe event to try (default 1 MiB)")
+    sp.add_argument("--keep", action="store_true", help="do not ask the relay to delete the probe events afterwards")
+
+    sp = sub.add_parser("relay-push", help="send events (and optionally manifests) from this store to a relay")
+    _key_args(sp)
+    sp.add_argument("relay")
+    sp.add_argument("--kinds", default=",".join(str(k) for k in (36778, 36779, 36780, 36781, 36782, 36783, 36784, 36785, 36786)))
+    sp.add_argument("--since", type=int)
+    sp.add_argument("--author", action="append")
+    sp.add_argument("--manifest-repo", action="append", default=[], help="also send the signed manifests held for this repo")
+    sp.add_argument("--max-event-bytes", type=int, default=65536, help="skip events bigger than this; relays often refuse over 64 KiB without publishing it (0: no limit)")
+
+    sp = sub.add_parser("relay-pull", help="read events (and optionally manifests) from a relay; each goes through admission like any other")
+    _key_args(sp)
+    sp.add_argument("relay")
+    sp.add_argument("--kinds", default=",".join(str(k) for k in (36778, 36779, 36780, 36781, 36782, 36783, 36784, 36785, 36786)))
+    sp.add_argument("--since", type=int)
+    sp.add_argument("--author", action="append")
+    sp.add_argument("--follow", action="store_true", help="ask only for keys THUB_ROOTS already trusts, and keep going as trust grows (ignores --author)")
+    sp.add_argument("--manifest-signer", action="append", default=[], help="a key whose manifests to take (hex or npub); needs --manifest-repo")
+    sp.add_argument("--manifest-repo", action="append", default=[])
 
     sp = sub.add_parser("lineage", help="what trusted derivation events say about a blob (from THUB_ROOTS)")
     sp.add_argument("sha256")
@@ -204,6 +231,49 @@ def run_event_command(args, settings, p) -> None:
             _emit(build_derivation(_secret(args, p), args.input, outs, args.tool, tool_x=args.tool_x, args=json.loads(args.args),
                                    data_origin=args.origin, synthetic_depth=args.depth,
                                    licences={"output": args.licence_out}), args.out)
+        elif c in ("relay-info", "relay-check", "relay-push", "relay-pull"):
+            import asyncio
+
+            from . import relay as R
+            from . import relay_sync as RS
+            from .admission import Admission as _Adm
+            from .eventstore import EventStore as _ES
+            from .store import Store as _Store
+
+            try:
+                if c == "relay-info":
+                    doc = asyncio.run(R.info(args.relay))
+                    lim = doc.get("limitation") or {}
+                    print(json.dumps({"name": doc.get("name"), "software": doc.get("software"), "version": doc.get("version"),
+                                      "supported_nips": doc.get("supported_nips"), "limitation": lim}, indent=1))
+                    if not lim:
+                        print("(the relay publishes no limits: run relay-check on a relay you run to measure them)")
+                elif c == "relay-check":
+                    pr = asyncio.run(R.probe(args.relay, max_bytes=args.max_bytes, delete=not args.keep))
+                    print(json.dumps(pr.asdict(), indent=1, default=str))
+                else:
+                    auth = _secret(args, p) if (args.key_file or os.environ.get("THUB_SIGNING_KEY")) else None
+                    adm = _Adm(_ES(settings.data_dir), settings.roots, hops=settings.trust_hops)
+                    kinds = [int(k) for k in args.kinds.split(",") if k]
+                    authors = [parse_pubkey(a) for a in (args.author or [])] or None
+                    if c == "relay-push":
+                        cap = args.max_event_bytes or None
+                        out = asyncio.run(RS.push(adm, args.relay, kinds, since=args.since, authors=authors, auth_secret=auth, max_event_bytes=cap))
+                        if args.manifest_repo:
+                            out["manifests"] = asyncio.run(RS.push_manifests(_Store(settings.data_dir), args.relay, args.manifest_repo, auth_secret=auth, max_event_bytes=cap))
+                    else:
+                        if args.follow:
+                            out = asyncio.run(RS.pull_following(adm, args.relay, kinds, since=args.since, auth_secret=auth))
+                        else:
+                            out = asyncio.run(RS.pull(adm, args.relay, kinds, since=args.since, authors=authors, auth_secret=auth))
+                        if args.manifest_signer:
+                            if not args.manifest_repo:
+                                raise SystemExit("error: --manifest-signer needs --manifest-repo")
+                            out["manifests"] = asyncio.run(RS.pull_manifests(_Store(settings.data_dir), args.relay, {parse_pubkey(k) for k in args.manifest_signer},
+                                                                              args.manifest_repo, auth_secret=auth))
+                    print(json.dumps(out))
+            except R.RelayError as e:
+                raise SystemExit(f"error: {e}")
         elif c == "request":
             from .workflow import Participant, make_request, wait_for_answer
 

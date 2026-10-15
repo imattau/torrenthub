@@ -241,3 +241,16 @@ THUB_ROOTS=<operator key> torrenthub request --hub https://hub.example --key-fil
 
 It works once the operator has endorsed the workers for `work:*` and `attest:*` and the requester for `request:*`. See `PROTOCOL.md` section 16.
 
+## Nostr relays
+
+Events are already Nostr events, so they can travel through relays as well as hubs. Install the extra (`pip install 'torrenthub[relay]'`), then:
+
+```bash
+torrenthub relay-info  wss://relay.example                 # its published limits
+torrenthub relay-push  wss://relay.example --key-file k    # send this store's events
+THUB_ROOTS=<your root> torrenthub relay-pull wss://relay.example --follow   # take only what your roots trust
+torrenthub relay-check ws://127.0.0.1:7777                 # TEST a relay you run: finds its real limits
+```
+
+A pulled event goes through the same checks as one from a hub, so a relay is trusted for nothing. Relays often refuse events over 64 KiB without publishing it; pushes skip those unless you pass `--max-event-bytes 0`. See `PROTOCOL.md` section 17 for what was measured.
+

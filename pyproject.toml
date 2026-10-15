@@ -8,7 +8,8 @@ dependencies = ["fastapi", "uvicorn", "httpx"]
 [project.optional-dependencies]
 swarm = ["libtorrent"]
 mcp = ["mcp>=2"]
-dev = ["pytest", "huggingface_hub", "mcp>=2"]
+relay = ["websockets"]
+dev = ["pytest", "huggingface_hub", "mcp>=2", "websockets"]
 
 [project.scripts]
 torrenthub = "torrenthub.cli:main"

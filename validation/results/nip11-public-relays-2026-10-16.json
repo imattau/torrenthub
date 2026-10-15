@@ -1,0 +1,101 @@
+{
+ "wss://relay.damus.io": {
+  "software": "it+https://github.com/hoytech/strfry.git",
+  "version": "1.1.0-158-gb705403ddf49",
+  "nips": 10,
+  "has_9": true,
+  "has_42": false,
+  "limitation": {
+   "max_message_length": 1000000,
+   "max_subscriptions": 200,
+   "max_limit": 500
+  },
+  "error": null
+ },
+ "wss://nos.lol": {
+  "software": "",
+  "version": null,
+  "nips": 0,
+  "has_9": false,
+  "has_42": false,
+  "limitation": {},
+  "error": null
+ },
+ "wss://relay.primal.net": {
+  "software": "it+https://github.com/hoytech/strfry.git",
+  "version": "1.1.3",
+  "nips": 9,
+  "has_9": true,
+  "has_42": false,
+  "limitation": {
+   "max_message_length": 1000000,
+   "max_subscriptions": 20,
+   "max_limit": 500
+  },
+  "error": null
+ },
+ "wss://relay.nostr.band": {
+  "software": "",
+  "version": null,
+  "nips": 0,
+  "has_9": false,
+  "has_42": false,
+  "limitation": {},
+  "error": null
+ },
+ "wss://nostr.wine": {
+  "software": "https://nostr.wine",
+  "version": "0.3.3",
+  "nips": 9,
+  "has_9": true,
+  "has_42": true,
+  "limitation": {
+   "max_message_length": 524288,
+   "max_event_tags": 4000,
+   "max_subscriptions": 50,
+   "max_limit": 1000,
+   "auth_required": false,
+   "payment_required": true,
+   "restricted_writes": true,
+   "min_pow_difficulty": 0,
+   "created_at_lower_limit": 94608000,
+   "created_at_upper_limit": 300
+  },
+  "error": null
+ },
+ "wss://relay.snort.social": {
+  "software": "https://github.com/v0l/memlay",
+  "version": "0.2.0",
+  "nips": 3,
+  "has_9": true,
+  "has_42": false,
+  "limitation": {
+   "max_message_length": 524288,
+   "max_subscriptions": 300,
+   "max_limit": 5000
+  },
+  "error": null
+ },
+ "wss://offchain.pub": {
+  "software": "it+https://github.com/hoytech/strfry.git",
+  "version": "1.1.0",
+  "nips": 10,
+  "has_9": true,
+  "has_42": false,
+  "limitation": {
+   "max_message_length": 131072,
+   "max_subscriptions": 20,
+   "max_limit": 500
+  },
+  "error": null
+ },
+ "wss://relay.nostr.bg": {
+  "software": "",
+  "version": null,
+  "nips": 0,
+  "has_9": false,
+  "has_42": false,
+  "limitation": {},
+  "error": null
+ }
+}
