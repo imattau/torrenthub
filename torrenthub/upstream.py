@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import fnmatch
+import time
 from contextlib import asynccontextmanager
 from typing import Callable
 from urllib.parse import quote, urlparse
@@ -12,7 +13,7 @@ import httpx
 
 from .federation import ConsensusError, Disagreement, NotEnoughAnswers, choose_consensus, fingerprint
 from .manifest import SHA40
-from .manifest import MAX_EVENT_BYTES, MAX_EVENTS_PER_REPO, ManifestInvalid, verify_manifest
+from .manifest import MAX_EVENT_BYTES, MAX_EVENTS_PER_REPO, MAX_TABLE_BYTES, ManifestInvalid, verify_manifest, with_table
 from .metrics import Metrics
 
 
@@ -102,6 +103,17 @@ class Upstream:
             return []
         return [e for e in events if isinstance(e, dict)][:MAX_EVENTS_PER_REPO] if isinstance(events, list) else []
 
+    async def fetch_table(self, sha256: str) -> bytes | None:
+        """The bytes of a published file table, by hash. None if this hub does not hold it. The
+        caller checks the hash; nothing here is believed."""
+        try:
+            r = await self.client.get(f"/blobs/{sha256}")
+        except httpx.HTTPError:
+            return None
+        if r.status_code != 200 or len(r.content) > MAX_TABLE_BYTES:
+            return None
+        return r.content
+
     async def model_info(self, repo_id: str, revision: str) -> dict:
         url = f"/api/models/{repo_id}/revision/{quote(revision, safe='')}"
         try:
@@ -165,8 +177,12 @@ class UpstreamSet:
         anchor_required: bool = True,
         trust: list[tuple[str, str]] | None = None,
         default_mode: str | None = None,
+        manifest_max_age: float | None = None,
     ):
         self.trust = list(trust or [])
+        # Longest a manifest's own timestamp may lag when a branch name is resolved (seconds).
+        # None means no limit. A commit sha is content addressed and is never refused for age.
+        self.manifest_max_age = manifest_max_age
         # Set by the app: (root keys, signer, scope) -> True if the signer holds a live delegation
         # chain from one of the roots for that scope. Without it only the listed keys may sign.
         self.delegation_check: Callable[[set, str, str], bool] | None = None
@@ -294,13 +310,37 @@ class UpstreamSet:
             self.metrics.inc("thub_manifest_total", len(valid), result="valid")
         if not valid:
             raise HubError(502, "NoValidManifest", f"no manifest for {repo_id} signed by a trusted key")
-        if SHA40.match(revision or ""):
+        pinned = bool(SHA40.match(revision or ""))
+        if pinned:
             cands = [m for m in valid if m.commit == revision]
         else:
             cands = [m for m in valid if revision in m.refs]
         if not cands:
             raise HubError(404, "RevisionNotFound", f"{repo_id}@{revision} has no signed manifest")
-        chosen = max(cands, key=lambda m: (m.created_at, m.id))
+        if not pinned:
+            # A branch name is a claim about now, so it can go stale. A commit sha cannot.
+            now = time.time()
+            fresh = [m for m in cands if not m.expired(now)]
+            if not fresh:
+                raise HubError(502, "ManifestExpired", f"every signed manifest for {repo_id}@{revision} has passed its valid_until")
+            cands = fresh
+        # The creator's own counter decides which claim is newest, so a hub cannot win by replaying
+        # an older manifest. Version 1 manifests have no counter and rank by timestamp among themselves.
+        chosen = max(cands, key=lambda m: (m.seq, m.created_at, m.id))
+        if not pinned and self.manifest_max_age is not None and time.time() - chosen.created_at > self.manifest_max_age:
+            raise HubError(502, "ManifestStale", f"the newest signed manifest for {repo_id}@{revision} is older than {self.manifest_max_age:.0f}s")
+        if chosen.needs_table:
+            for u in self.sources:
+                blob = await u.fetch_table(chosen.files_x)
+                if blob is not None:
+                    try:
+                        chosen = with_table(chosen, blob)
+                        break
+                    except ManifestInvalid:
+                        if self.metrics:
+                            self.metrics.inc("thub_manifest_total", result="bad_table")
+            if chosen.needs_table:
+                raise UpstreamUnavailable(f"no hub could supply the file table {chosen.files_x[:12]} that {repo_id}@{chosen.commit[:12]} was signed with")
         mismatched = False
         for u in self.sources:
             kind, info = await self._ask(u, repo_id, chosen.commit)
@@ -439,4 +479,5 @@ def make_upstream(settings) -> "Upstream | UpstreamSet":
     if anchor is None and len(sources) == 1 and settings.quorum <= 1 and not trust:
         return sources[0]
     quorum = min(settings.quorum, len(sources)) if anchor else settings.quorum
-    return UpstreamSet(sources, quorum, settings.meta_timeout, anchor, settings.anchor_required, trust)
+    return UpstreamSet(sources, quorum, settings.meta_timeout, anchor, settings.anchor_required, trust,
+                       manifest_max_age=getattr(settings, "manifest_max_age", None))

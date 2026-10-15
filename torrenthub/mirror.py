@@ -224,6 +224,11 @@ class Mirror:
         if SHA40.match(revision) and self.store.has_commit(repo_id, revision):
             return revision
         ref = self.store.get_ref(repo_id, revision)
+        if self.store.is_published(repo_id):
+            # Published here: this hub is where the repo lives, so there is no upstream to ask.
+            if ref:
+                return ref[0]
+            raise HubError(404, "RevisionNotFound", f"{repo_id}@{revision} is not published here")
         if ref and time.time() - ref[1] < self.s.ref_ttl:
             return ref[0]
         if not self.s.lazy_mirror and ref is None:

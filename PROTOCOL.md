@@ -61,7 +61,7 @@ References to content use the tag names NIP-94 (file metadata) already uses, so 
 Key, optional recovery key, label, optional contact or operator note. `supersedes` points to an older identity event of the same key or of a key whose recovery key signs this. Only the first identity event of a key is taken on trust by anyone. After that, a change needs the old key or its declared recovery key. Moving a key's standing to a new key is done with a `revocation` that names a `successor` (section 3.7), not with this event.
 
 ### 3.2 `manifest` (exists)
-A repo's file table at a commit, signed by the namespace owner. v2 adds `seq` (strictly increasing per repo and ref), `valid_until` (optional), and `files_x`/`files_i` to move a large table into a blob.
+A repo's file table at a commit, signed by the namespace owner. v2 (built, section 15) adds `seq` (strictly increasing per repo and ref), `valid_until` (optional), and `files_x`/`files_i` to move a large table into a blob. A consumer ranks manifests by `seq` first, so a replayed old manifest loses whatever its timestamp says.
 
 ### 3.3 `delegation`
 Issuer authorises a key to act for it. Fields: `subject` key, `scope` (a list such as `publish:acme/*`, `attest:*`), limits (`max_bytes_per_day`, `max_events_per_day`), `not_before`, `expires`, `revocable` (always true in v1), `redelegable` (may the delegate pass the authority on; default false). A manifest signed by a delegate is valid for a rule `acme/*=signed:ROOT` when a chain of unexpired, unrevoked delegations covers `publish:<repo>` from ROOT to the signer. Delegation transfers authority. Anyone can verify it from the root alone. It is not an opinion.
@@ -140,7 +140,7 @@ A hub or agent can run a **verifier**: it watches for new blobs and attestations
 - `GET /api/thub/events` with filters (kinds, authors, referenced `x`, `e`, `i`, since, limit). This generalises the manifest endpoint and has the same shape as a Nostr REQ filter, so a relay adapter is easy later.
 - `POST /api/thub/events` is a new attack surface and the reason admission control exists. Order of checks: size limit, valid id and signature, known kind, per key token bucket, then tiering. A key in the hub's own trust graph goes in the main store with a large quota. A stranger goes to quarantine with a small quota and a short life. Quarantined events are served only on request.
 - The delegation's `limits` are enforced by the hub that admits events for that delegate, since limits cannot be enforced by the signature itself.
-- Publishing an artifact needs no upload API: the publisher seeds the torrent and posts a manifest or derivation event. A hub that admits it fetches by infohash and validates against the signed hashes, the same way agents do now. I have not tested a hub pulling from a publisher it has no direct connection to. NAT and discovery make that harder than it sounds.
+- Publishing an artifact (built, section 15): the publisher signs a v2 manifest, posts it to `POST /api/thub/publish` with the torrents of its big files, and seeds them. The hub validates, joins each swarm, and the publisher **dials the hub**, so the publisher needs no open port. The hub then checks every byte against the signed sha256 before anything becomes visible.
 
 ## 8. Transport
 
@@ -186,7 +186,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P1 (built, section 12; the rules that need derivations or manifest v2 wait for P3 and P4) | Generalise to an event store and API. Identity, delegation, endorsement and revocation events. The trust evaluator and policy engine. CLI. Admission control. | The simulation tests in section 9 pass, including order independence and the sybil and collusion cases, with timings for a large event set |
 | P2 (built, section 13) | Attestations: `hash_verified` and `format_scan`, a verifier agent, replication events, `independent(n)`, a signer process, and the MCP write tools (read and download tools already exist, M0) | A verifier agent publishes, a consumer policy changes behaviour because of it, and a bad attestor is caught by replication |
 | P3 (built, section 14; the gate is only partly met) | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |
-| P4 | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
+| P4 (built, section 15; gate met in a simulation of NAT, not behind a real router) | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
 | P5 | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
 | P6 | Nostr relay adapter | Events round trip through a real relay, with size limits known |
 
@@ -299,3 +299,31 @@ python3 validation/determinism.py compare validation/results/determinism-2026-10
 - Licence checks (`licences` is recorded and shown, nothing acts on it), data origin checks beyond the depth cap, and `max_age` (P4).
 - Depth is only as good as the declared data: undeclared synthetic data is invisible, and a derivation nobody trusted never reaches the graph. Hiding lineage hides taint.
 - The measured tools run on CPUs and numpy only. GPUs, quantisers such as GGUF and GPTQ, and merging tools are untested.
+
+## 15. What is built (P4)
+
+Code: `manifest.py` (version 2), `publish.py` (the hub's side), `publisher.py` and the `torrenthub publish` command (the publisher's side), `Store` tables `published` and `publish_charges`, and the consumer changes in `upstream.py`. Endpoints: `POST /api/thub/publish`, `GET /api/thub/publish/<job>`. Tests: `tests/test_manifest_v2.py`, `tests/test_publish.py`.
+
+**Manifest v2**
+- `seq` is a counter the creator controls (1 or more). Consumers pick the manifest with the highest `seq` for a branch name, then the newest timestamp, so a hub cannot make an old manifest win by replaying it (tested with an old `seq` carrying a fresher clock). Version 1 manifests count as `seq` 0.
+- `valid_until` marks when a manifest stops being worth believing. A consumer ignores expired manifests when it resolves a **branch name**, and says `ManifestExpired` if none is left. A pinned commit sha is content addressed and is never refused for age. `THUB_MANIFEST_MAX_AGE` (seconds) additionally refuses a branch name whose newest manifest is older than that (`ManifestStale`).
+- `files_x` replaces an inline file table with its sha256 once there are more than 200 rows. The table is a blob that the hub serves at `/blobs/<sha256>`; the consumer checks the bytes against the signed hash and the canonical encoding. `files_i` (an infohash for the table) is carried and checked for shape; nothing seeds the table by torrent yet.
+- For a published repo the commit is the first 40 hex characters of the table's sha256, so it names the file table and two different tables cannot share a name.
+
+**Publishing**
+- The hub (`THUB_PUBLISH_QUOTA`, off at 0) checks, before taking any big file: the manifest signature; that the signer is a root or holds a delegation from one for `publish:<repo>` (a revoked signer is refused); that the manifest is v2, not expired and not dated in the future; that paths are safe and the commit names the table; that `seq` is above everything held for each branch name (an exact repeat is a no-op); each torrent against the piece policy, the signed size and the signed hash; and the signer's quota, counting only bytes the hub does not already hold. Small files (up to 3 MiB in all) travel in the request and are hashed on arrival.
+- Big files: the hub starts a swarm download per torrent and the publisher, which has seeded and dialled the hub's swarm port, sends the bytes. Each finished file is hashed whole and compared with the signed sha256. Only when every file is in does the repo appear: charges, then commit and refs, then the manifest. A failed or stalled publication (`THUB_PUBLISH_STALL`, `THUB_PUBLISH_TIMEOUT`) leaves nothing a reader can see.
+- Published blobs are never evicted by the disk budget, and a published repo is never re-asked of an upstream: the hub is where it lives.
+- `torrenthub publish --repo OWNER/NAME --dir D --hub URL --key-file F` hashes the directory, signs, posts, seeds and waits. `--seq auto` asks the hub for the next number.
+
+**Measured: the gate.** A publisher VM with a firewall dropping every inbound packet (the hub could not connect to it on any port, or ping it) published `Qwen/Qwen2.5-0.5B` (954 MB, 10 files) to a hub VM: 4.8 s of transfer, 10 s in all with hashing. An agent on the host that pins the publisher's key resolved it through the signed manifest and fetched it: 953 MiB at 258 MiB/s, 100% from the swarm, 0 fallbacks, 0 integrity failures, and all 10 files identical to the publisher's. An agent pinning a different key got `NoValidManifest`. This is a simulation of NAT: one virtual bridge, inbound blocked by the publisher's firewall, no address translation and no home router in between. What matters for the design (the hub cannot dial the publisher) is the same; things a real router adds (port mapping, timeouts of idle connections, carrier grade NAT) are untested. It also does not rely on discovery: the publisher knows the hub's address from the URL.
+
+**Not built, or limited**
+- No HTTP upload fallback. A hub with no swarm cannot take files over 3 MiB, and a publisher needs libtorrent.
+- Quotas are per signing key on one hub. Nothing stops a publisher spending its quota on junk, there is no per-key request rate limit beyond two publications in flight, and a delegate shares nothing with its root.
+- Removing a published repo or a branch name is not built (`block` removes a blob). Old commits stay pinnable after `seq` moves the branch.
+- Publication jobs live in memory: a hub restart forgets one in flight (the publisher runs it again; held blobs are not charged twice).
+- `THUB_MANIFEST_MAX_AGE` is an environment setting, not a rule in the policy file.
+- A manifest the hub never receives cannot be told apart from one that does not exist, and a hub can still withhold the newest one. `valid_until`, a maximum age and asking several hubs reduce that; they do not remove it.
+- Only publishing from the command line was exercised. Nothing signs or publishes through the signer process or the MCP server yet.
+

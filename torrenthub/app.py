@@ -21,6 +21,7 @@ from .metrics import Metrics
 from .gaplog import GapLog
 from .mirror import Inflight, Mirror
 from .policy import check_file, load_policy
+from .publish import Ingest, PublishError
 from .store import Store
 from .swarm import Swarm, make_swarm
 from .torrent import magnet
@@ -239,6 +240,7 @@ def create_app(
         upstream.delegation_check = lambda roots, signer, scope: admission.graph().may_sign(roots, signer, scope) is not None
     policy_rules = load_policy(settings.policy)
     mirror = Mirror(settings, store, upstream, swarm, metrics)
+    ingest = Ingest(settings, store, swarm, pinned, lambda: admission.graph(), metrics)
 
     def served(n: int) -> None:
         metrics.inc("thub_bytes_served_total", n)
@@ -249,12 +251,14 @@ def create_app(
             if store.blob_complete(b.key):
                 await swarm.seed(store.torrent_path(b.key), store.blob_path(b.key).parent)
         yield
+        await ingest.aclose()
         await mirror.aclose()
         await swarm.close()
         await upstream.aclose()
 
     app = FastAPI(title="torrenthub", lifespan=lifespan)
     app.state.mirror = mirror
+    app.state.ingest = ingest
     app.state.store = store
     app.state.metrics = metrics
     app.state.events = events
@@ -380,6 +384,28 @@ def create_app(
         out = events.query(kinds or None, many("authors") or None, tags, since, until, limit,
                            include_quarantine=q.get("quarantine") == "1")
         return JSONResponse({"events": out}, headers={"X-Mirror": "torrenthub"})
+
+    @app.post("/api/thub/publish")
+    async def publish(request: Request):
+        """Take in a repo a publisher signed (publish.py). Answers at once; the transfer of big
+        files runs in the background and the publisher watches /api/thub/publish/<job>."""
+        try:
+            body = await request.json()
+        except ValueError:
+            raise HubError(400, "BadRequest", "body is not JSON") from None
+        try:
+            out = await ingest.submit(body)
+        except PublishError as e:
+            metrics.inc("thub_publish_total", result="refused")
+            raise HubError(e.status, e.code, e.message) from None
+        return JSONResponse(out, status_code=200 if out.get("already") else 202)
+
+    @app.get("/api/thub/publish/{job_id}")
+    async def publish_status(job_id: str):
+        st = ingest.status(job_id)
+        if st is None:
+            raise HubError(404, "EntryNotFound", "no such publication (jobs are forgotten when the hub restarts)")
+        return st
 
     @app.get("/api/thub/lineage/{sha256}")
     async def lineage_of(sha256: str):

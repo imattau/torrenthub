@@ -212,6 +212,13 @@ def strip_webseeds(data: bytes) -> bytes:
     return bencode(meta)
 
 
+def with_webseeds(data: bytes, seeds: list[str]) -> bytes:
+    """Add web seed URLs to a torrent. The infohash does not change."""
+    meta = bdecode(data)
+    meta[b"url-list"] = [s.encode() for s in seeds]
+    return bencode(meta)
+
+
 def infohash_from_torrent(data: bytes) -> str:
     return hashlib.sha1(bencode(bdecode(data)[b"info"])).hexdigest()
 

@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -58,6 +58,18 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--origin", default="unknown", choices=["human", "synthetic", "mixed", "unknown"])
     sp.add_argument("--depth", type=int, default=0, help="generations of synthetic data behind the output")
     sp.add_argument("--licence-out", default="")
+
+    sp = sub.add_parser("publish", help="publish a directory as a signed repo on a hub; works from behind NAT (the hub never connects to you)")
+    _key_args(sp)
+    sp.add_argument("--repo", required=True, help="owner/name")
+    sp.add_argument("--dir", required=True)
+    sp.add_argument("--hub", required=True, help="base URL of a hub that takes publications")
+    sp.add_argument("--ref", action="append", help="branch name the manifest claims (default main)")
+    sp.add_argument("--seq", default="auto", help="the manifest counter; auto asks the hub for the next one")
+    sp.add_argument("--valid-days", type=float, help="stop believing this manifest after this many days")
+    sp.add_argument("--stage", help="folder for the staged big files (default: a temporary one next to the data dir)")
+    sp.add_argument("--timeout", type=float, default=3600)
+    sp.add_argument("--tracker", action="append", default=[])
 
     sp = sub.add_parser("lineage", help="what trusted derivation events say about a blob (from THUB_ROOTS)")
     sp.add_argument("sha256")
@@ -163,6 +175,46 @@ def run_event_command(args, settings, p) -> None:
             _emit(build_derivation(_secret(args, p), args.input, outs, args.tool, tool_x=args.tool_x, args=json.loads(args.args),
                                    data_origin=args.origin, synthetic_depth=args.depth,
                                    licences={"output": args.licence_out}), args.out)
+        elif c == "publish":
+            import asyncio
+            import tempfile
+
+            import httpx
+
+            from .publisher import next_seq, prepare, publish
+            from .swarm import LibtorrentSwarm
+
+            secret = _secret(args, p)
+            refs = tuple(args.ref or ["main"])
+            hub = args.hub.rstrip("/")
+
+            async def go():
+                async with httpx.AsyncClient(timeout=30) as client:
+                    seq = await next_seq(client, hub, args.repo, refs[0]) if args.seq == "auto" else int(args.seq)
+                stage = Path(args.stage) if args.stage else Path(tempfile.mkdtemp(prefix="thub-publish-"))
+                print(f"hashing {args.dir} ...", flush=True)
+                pub = prepare(secret, args.repo, Path(args.dir), stage, refs=refs, seq=seq,
+                              valid_for=args.valid_days * 86400 if args.valid_days else None, trackers=args.tracker)
+                print(f"commit {pub.commit}, seq {seq}, {len(pub.body['inline'])} small and {len(pub.torrents)} big files", flush=True)
+                swarm = LibtorrentSwarm(0, dht=False)
+                last = [""]
+
+                def show(st):
+                    line = "; ".join(f"{f['path']} {f['bytes'] * 100 // max(f['size'], 1)}%" for f in st["files"].values() if f["state"] in ("pulling", "checking"))
+                    if line and line != last[0]:
+                        last[0] = line
+                        print("hub is pulling:", line, flush=True)
+
+                try:
+                    return await publish(hub, pub, swarm, timeout=args.timeout, progress=show)
+                finally:
+                    await swarm.close()
+
+            try:
+                res = asyncio.run(go())
+            except (RuntimeError, ValueError) as e:
+                raise SystemExit(f"error: {e}")
+            print(json.dumps({k: res.get(k) for k in ("state", "repo", "commit", "seconds", "already")}))
         elif c == "revoke":
             target = key(args.target) if args.kind == "key" else args.target
             succ = key(args.successor) if args.successor else None

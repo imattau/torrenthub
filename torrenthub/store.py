@@ -47,6 +47,13 @@ CREATE TABLE IF NOT EXISTS trust (
 CREATE TABLE IF NOT EXISTS blocked (
   key TEXT PRIMARY KEY, reason TEXT NOT NULL, at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS published (
+  repo_id TEXT PRIMARY KEY, signer TEXT NOT NULL, first_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS publish_charges (
+  signer TEXT NOT NULL, blob_key TEXT NOT NULL, size INTEGER NOT NULL, at REAL NOT NULL,
+  PRIMARY KEY (signer, blob_key)
+);
 """
 
 
@@ -251,11 +258,30 @@ class Store:
         with self._lock:
             return int(self._db.execute("SELECT COUNT(*) AS n FROM blobs WHERE state='complete'").fetchone()["n"])
 
+    # published repos: content that exists nowhere else, so it is never evicted and never re-asked of an upstream
+    def mark_published(self, repo_id: str, signer: str) -> None:
+        with self._lock, self._db:
+            self._db.execute("INSERT OR IGNORE INTO published VALUES (?,?,?)", (repo_id, signer, time.time()))
+
+    def is_published(self, repo_id: str) -> bool:
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM published WHERE repo_id=?", (repo_id,)).fetchone() is not None
+
+    def charge(self, signer: str, blob_key: str, size: int) -> None:
+        with self._lock, self._db:
+            self._db.execute("INSERT OR IGNORE INTO publish_charges VALUES (?,?,?,?)", (signer, blob_key, size, time.time()))
+
+    def charged_bytes(self, signer: str) -> int:
+        with self._lock:
+            return int(self._db.execute("SELECT COALESCE(SUM(size), 0) AS n FROM publish_charges WHERE signer=?", (signer,)).fetchone()["n"])
+
     def lru_candidates(self) -> list[BlobRow]:
-        """Complete blobs that can be refilled from the swarm, least recently used first."""
+        """Complete blobs that can be refilled from the swarm, least recently used first. Blobs a
+        publisher put here are left out: if the publisher is gone, nobody could refill them."""
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM blobs WHERE state='complete' AND infohash IS NOT NULL ORDER BY last_access ASC"
+                "SELECT * FROM blobs WHERE state='complete' AND infohash IS NOT NULL "
+                "AND key NOT IN (SELECT blob_key FROM publish_charges) ORDER BY last_access ASC"
             ).fetchall()
         return [BlobRow(**dict(r)) for r in rows]
 

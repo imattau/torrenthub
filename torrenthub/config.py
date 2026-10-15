@@ -127,6 +127,16 @@ class Settings:
     peers: list[str] = field(default_factory=list)
     # Dial peers over uTP first (libtorrent's default). Off: dial TCP. See swarm.py for why.
     outgoing_utp: bool = False
+    # Refuse to resolve a branch name through a signed manifest older than this many seconds.
+    manifest_max_age: float | None = None
+    # Publishing (PROTOCOL.md section 7). 0 turns the publish endpoint off. Otherwise this is how
+    # many bytes of published content one signing key may have on this hub.
+    publish_quota: int = 0
+    publish_stall: float = 120.0  # seconds a publisher may go without sending anything
+    publish_timeout: float = 3600.0  # longest a publication may take in all
+    publish_inline_max: int = 4 * 1024 * 1024  # small files sent in the request itself, in all
+    publish_max_files: int = 5000
+    publish_max_jobs_per_key: int = 2
     # Keys this gateway pins as roots (hex or npub). Events from keys reachable from a root go in
     # the main event store with a large allowance. Everyone else is quarantined. See PROTOCOL.md.
     roots: list[str] = field(default_factory=list)
@@ -183,6 +193,10 @@ class Settings:
             listen_port=int(e("THUB_LISTEN_PORT", "6881")),
             peers=_list(e("THUB_PEERS"), []),
             outgoing_utp=_bool(e("THUB_OUTGOING_UTP"), False),
+            manifest_max_age=float(e("THUB_MANIFEST_MAX_AGE")) if e("THUB_MANIFEST_MAX_AGE") else None,
+            publish_quota=parse_size(e("THUB_PUBLISH_QUOTA"), 0),
+            publish_stall=float(e("THUB_PUBLISH_STALL", "120")),
+            publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),
             roots=parse_keys(e("THUB_ROOTS")),
             trust_hops=int(e("THUB_TRUST_HOPS", "3")),
             policy=e("THUB_POLICY") or None,

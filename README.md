@@ -151,6 +151,9 @@ Gateway endpoints beyond the HF API: `/metrics` (Prometheus text), `/healthz`, `
 | `THUB_ROOTS` | none | Public keys (hex or npub, comma separated) this gateway starts its trust from. Keys named in `signed:` rules count too |
 | `THUB_TRUST_HOPS` | `3` | Longest chain of endorsements followed from a root |
 | `THUB_POLICY` | none | TOML file of rules for what must be attested before a file is served. See `PROTOCOL.md` section 13 |
+| `THUB_PUBLISH_QUOTA` | `0` | Bytes of published content one signing key may hold here, such as `10G`. 0 turns publishing off. Only roots and their `publish:<repo>` delegates may publish |
+| `THUB_PUBLISH_STALL` / `THUB_PUBLISH_TIMEOUT` | `120` / `3600` | Seconds a publisher may send nothing, and the longest a publication may take |
+| `THUB_MANIFEST_MAX_AGE` | none | Seconds. Refuse to resolve a branch name through a signed manifest older than this |
 | `THUB_OUTGOING_UTP` | `false` | Dial peers over uTP first, which is libtorrent's own default. Off means TCP. Between two machines on a fast link uTP-first was about 15x slower |
 | `THUB_PEERS` | none | Static peer hints, `host:port` comma separated. Discovery stays on. Useful to tell "transfer works" from "discovery works" |
 | `THUB_SWARM_FIRST` | `false` | Agent mode: fetch the torrent from the upstream hub and download from peers first |
@@ -211,3 +214,14 @@ Built: identity, delegation, endorsement, revocation and attestation events, a t
 ## Diagnosing stalls
 
 `THUB_GAP_WARN` (seconds, default 5, 0 disables) logs pauses in a stream on the `torrenthub.gaps` logger, once for the upstream download and once for each client reading it, with a summary line when each ends. Compare the two max gaps to tell an upstream stall from bytes held back by the gateway (1 MiB upstream chunks plus `THUB_STREAM_HOLDBACK`). A client that sees no data for ~10s gives up, which is the `huggingface_hub` read timeout.
+
+## Publishing
+
+A hub started with `THUB_PUBLISH_QUOTA=10G` and `THUB_ROOTS=<your public key>` takes repos you sign. From any machine, including one behind NAT or a firewall that allows no inbound connections:
+
+```bash
+torrenthub publish --repo you/model --dir ./model --hub https://hub.example --key-file ~/.thub/key
+```
+
+It hashes the directory, signs a manifest, sends it with the torrents of the big files, then seeds them and dials the hub, which pulls the bytes and checks them against the signed hashes before anything is visible. Agents fetch it with `THUB_TRUST="you/*=signed:<your public key>"`. Use `--valid-days N` to make a manifest expire.
+

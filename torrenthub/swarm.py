@@ -164,6 +164,16 @@ class LibtorrentSwarm(Swarm):
         atp.flags |= self.lt.torrent_flags.seed_mode
         self.ses.add_torrent(atp)
 
+    async def connect(self, torrent_path: Path, host: str, port: int) -> bool:
+        """Dial a peer for a torrent we already hold. For a publisher behind NAT this is how the
+        hub gets the bytes: the connection goes out, so no open port is needed. True if the
+        torrent is known to the session."""
+        h = self.ses.find_torrent(self.lt.torrent_info(str(torrent_path)).info_hashes().v1)
+        if not h.is_valid():
+            return False
+        h.connect_peer((host, port))
+        return True
+
     async def forget(self, torrent_path: Path) -> None:
         ti = self.lt.torrent_info(str(torrent_path))
         h = self.ses.find_torrent(ti.info_hashes().v1)

@@ -126,3 +126,8 @@ Not covered: a recently created repo (the probe's own advice), gated repos, shar
 ## Determinism (P3)
 
 `determinism.py` checks whether a tool gives the same bytes in different environments, which is what decides whether a derivation can ever be class D. Results from this host and two VMs are in `results/determinism-2026-10-16.jsonl`, and the reading of them, with the one gate still open (a second physical machine), is in `PROTOCOL.md` section 14. In short: an integer cast and a float reduction were bit exact in 39 of 39 runs each, a float32 matrix product was not (7 different outputs; the BLAS kernel and the thread count both change the bytes).
+
+## Publishing from behind NAT (P4)
+
+On the VMs: a publisher with every inbound packet dropped (the hub could not open any connection to it, or ping it) ran `torrenthub publish` for `Qwen/Qwen2.5-0.5B` (954 MB). The hub took it in 4.8 s, and an agent pinning the publisher's key fetched it 100% over the swarm with all 10 files identical to the source. It does not exercise a real router or carrier grade NAT. Details and limits are in `PROTOCOL.md` section 15.
+
