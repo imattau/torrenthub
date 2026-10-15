@@ -107,6 +107,7 @@ class Revocation:
     reason: str
     severity: str
     taint: bool
+    successor: str | None = None  # rotation: the key that inherits the revoked key's standing
 
 
 def _dump(body: dict) -> str:
@@ -168,7 +169,7 @@ def build_endorsement(secret: bytes, subject: str, scope, weight: float, *, dele
 
 
 def build_revocation(secret: bytes, target_kind: str, target: str, reason: str = "", severity: str = "normal",
-                     taint: bool = False, created_at: int | None = None) -> dict:
+                     taint: bool = False, successor: str | None = None, created_at: int | None = None) -> dict:
     if target_kind not in TARGET_KINDS:
         raise ValueError(f"target_kind must be one of {TARGET_KINDS}")
     if not HEX64.match(target):
@@ -176,7 +177,16 @@ def build_revocation(secret: bytes, target_kind: str, target: str, reason: str =
     body = {"v": 1, "target_kind": target_kind, "target": target, "reason": reason[:500],
             "severity": severity if severity in ("low", "normal", "high") else "normal", "taint": bool(taint)}
     tag = {"event": "e", "key": "p", "x": "x"}[target_kind]
-    return sign_event(secret, REVOCATION, [[tag, target]], _dump(body), _now(created_at))
+    tags = [[tag, target]]
+    if successor is not None:
+        # Key rotation: revoke the old key and name the key that takes over its standing.
+        if target_kind != "key":
+            raise ValueError("only a key can have a successor")
+        if not HEX64.match(successor) or successor == target:
+            raise ValueError("successor must be a different key of 64 hex characters")
+        body["successor"] = successor
+        tags.append(["p", successor, "successor"])
+    return sign_event(secret, REVOCATION, tags, _dump(body), _now(created_at))
 
 
 def build_attestation(secret: bytes, claim: str, subject_kind: str, subject: str, *, ok: bool | None = None,
@@ -296,8 +306,14 @@ def parse_event(ev: dict, check_sig: bool = True):
         if not isinstance(target, str) or not HEX64.match(target):
             raise ValueError("bad target")
         _check_tag(ev, {"event": "e", "key": "p", "x": "x"}[tk], target)
+        succ = body.get("successor")
+        if succ is not None:
+            if tk != "key" or not isinstance(succ, str) or not HEX64.match(succ) or succ == target:
+                raise ValueError("bad successor")
+            if not any(len(t) >= 3 and t[0] == "p" and t[1] == succ and t[2] == "successor" for t in ev["tags"]):
+                raise ValueError("missing successor tag that matches the signed content")
         return Revocation(eid, pub, ts, tk, target, str(body.get("reason", ""))[:500],
-                          str(body.get("severity", "normal")), bool(body.get("taint", False)))
+                          str(body.get("severity", "normal")), bool(body.get("taint", False)), succ)
     except EventInvalid:
         raise
     except (KeyError, TypeError, ValueError, AttributeError) as e:

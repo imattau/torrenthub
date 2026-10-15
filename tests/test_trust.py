@@ -356,3 +356,210 @@ def test_a_large_graph_is_quick():
     trusted = sum(1 for k in keys if g.trust(k).value > 0)
     assert len(evs) > 8000 and trusted > 100, (len(evs), trusted)
     assert time.monotonic() - t < 10
+
+
+# ---------------------------------------------------------- key rotation
+
+def test_rotation_hands_incoming_trust_to_the_successor():
+    e1 = endorse(1, 2, w=0.8)  # ROOT endorses A
+    rot = E.build_revocation(key(2), "key", A, successor=B, created_at=200)
+    g = graph([e1, rot])
+    assert g.trust(A).value == 0, "the old key is revoked"
+    assert g.trust(B).value == pytest.approx(0.8), "the new key inherits"
+    assert g.successor_of(A) == B
+    assert [(a, b) for a, b, _ in g.trust(B).path] == [(ROOT, B)]
+
+
+def test_rotation_does_not_hand_over_what_the_old_key_issued():
+    evs = [endorse(1, 2, w=0.9), endorse(2, 6, w=0.9, delegable=False), E.build_revocation(key(2), "key", A, successor=B, created_at=200)]
+    g = graph(evs)
+    assert g.trust(X).value == 0, "A's own endorsement of X stays dead; B must issue its own"
+
+
+def test_rotation_carries_delegations_too():
+    d = delegate(1, 2, "publish:acme/*")
+    rot = E.build_revocation(key(2), "key", A, successor=B, created_at=200)
+    g = graph([d, rot])
+    assert g.may_sign([ROOT], B, "publish:acme/m")
+    assert not g.may_sign([ROOT], A, "publish:acme/m")
+
+
+def test_with_a_recovery_key_only_the_recovery_key_can_name_the_successor():
+    ident = E.build_identity(key(2), "agent", recovery=D, created_at=50)
+    e1 = endorse(1, 2, w=0.8)
+    thief = E.build_revocation(key(2), "key", A, successor=Z, created_at=200)  # signed by the old key itself
+    real = E.build_revocation(key(5), "key", A, successor=B, created_at=300)  # signed by the recovery key
+    g = graph([ident, e1, thief, real])
+    assert g.trust(Z).value == 0 and g.trust(B).value == pytest.approx(0.8)
+    assert g.trust(A).value == 0, "the thief's statement still revokes the old key"
+    assert graph([ident, e1, thief]).trust(Z).value == 0, "and without the recovery key's answer nobody inherits"
+
+
+def test_the_earliest_valid_rotation_wins():
+    e1 = endorse(1, 2, w=0.8)
+    first = E.build_revocation(key(2), "key", A, successor=B, created_at=200)
+    later = E.build_revocation(key(2), "key", A, successor=Z, created_at=300)
+    g = graph([e1, later, first])
+    assert g.trust(B).value > 0 and g.trust(Z).value == 0
+
+
+def test_rotations_chain_and_loops_are_ignored():
+    e1 = endorse(1, 2, w=0.8)
+    a_to_b = E.build_revocation(key(2), "key", A, successor=B, created_at=200)
+    b_to_c = E.build_revocation(key(3), "key", B, successor=C, created_at=300)
+    g = graph([e1, a_to_b, b_to_c])
+    assert g.trust(C).value == pytest.approx(0.8) and g.successor_of(A) == C
+    c_to_a = E.build_revocation(key(4), "key", C, successor=A, created_at=400)
+    g = graph([e1, a_to_b, b_to_c, c_to_a])
+    assert all(g.trust(k).value == 0 for k in (A, B, C))
+
+
+def test_a_revoked_successor_inherits_nothing():
+    e1 = endorse(1, 2, w=0.8)
+    rot = E.build_revocation(key(2), "key", A, successor=B, created_at=200)
+    kill = E.build_revocation(key(3), "key", B, created_at=250)
+    assert graph([e1, rot, kill]).trust(B).value == 0
+
+
+def test_a_consumers_root_is_not_replaced_by_a_rotation():
+    rot = E.build_revocation(key(1), "key", ROOT, successor=A, created_at=200)
+    g = graph([rot])
+    assert A not in g.roots and g.trust(A).value == 0
+
+
+def test_rotation_is_order_independent():
+    evs = [endorse(1, 2, w=0.8), E.build_revocation(key(2), "key", A, successor=B, created_at=200),
+           E.build_revocation(key(3), "key", B, successor=C, created_at=300), endorse(1, 5, w=0.5)]
+    want = {k: graph(evs).trust(k).value for k in (A, B, C, D)}
+    rng = random.Random(7)
+    for _ in range(10):
+        shuffled = evs[:]
+        rng.shuffle(shuffled)
+        assert {k: graph(shuffled).trust(k).value for k in (A, B, C, D)} == want
+
+
+def test_successor_is_checked_when_parsing():
+    ev = E.build_revocation(key(2), "key", A, successor=B, created_at=200)
+    assert E.parse_event(ev).successor == B
+    with pytest.raises(ValueError):
+        E.build_revocation(key(2), "event", "ab" * 32, successor=B)
+    with pytest.raises(ValueError):
+        E.build_revocation(key(2), "key", A, successor=A)
+    forged = dict(ev)
+    forged["tags"] = [t for t in ev["tags"] if len(t) < 3]
+    forged = sg.sign_event(key(2), ev["kind"], forged["tags"], ev["content"], ev["created_at"])
+    with pytest.raises(E.EventInvalid):
+        E.parse_event(forged)
+
+
+# ------------------------------------------------------ exact independence
+
+def test_exact_independence_beats_greedy_when_the_best_paths_collide():
+    # X's best path and Y's only path both go through A, but X has a second route through B.
+    evs = [endorse(1, 2, w=0.9), endorse(1, 3, w=0.5), endorse(2, 6, w=0.9, delegable=False),
+           endorse(3, 6, w=0.9, delegable=False), endorse(2, 7, w=0.5, delegable=False)]
+    g = graph(evs)
+    assert len(g.independent_greedy([X, Y], None, 2)) == 1
+    got, exact = g.independent_ex([X, Y], None, 2)
+    assert exact and sorted(got) == sorted([X, Y])
+
+
+def test_exact_independence_still_refuses_a_real_cluster():
+    evs = [endorse(1, 2, w=0.7)] + [endorse(2, n, w=1.0, delegable=False) for n in range(100, 105)]
+    g = graph(evs)
+    got, exact = g.independent_ex([pub(n) for n in range(100, 105)], None, 2)
+    assert exact and len(got) == 1
+
+
+def test_exact_independence_respects_hops_scope_delegable_and_minimum():
+    evs = [endorse(1, 2, w=0.9), endorse(2, 3, w=0.9), endorse(3, 6, w=0.9, delegable=False)]
+    assert graph(evs, hops=3).independent_ex([X], None, 1)[0] == [X]
+    assert graph(evs, hops=2).independent_ex([X], None, 1)[0] == []  # three edges needed
+    assert graph(evs, hops=3).independent_ex([X], None, 1, minimum=0.8)[0] == []  # 0.729 is not above 0.8
+    notdel = [endorse(1, 2, w=0.9, delegable=False), endorse(2, 6, w=0.9, delegable=False)]
+    assert graph(notdel).independent_ex([X], None, 1)[0] == []
+    scoped = [endorse(1, 6, scope="attest:format_scan", delegable=False)]
+    assert graph(scoped).independent_ex([X], "attest:format_scan", 1)[0] == [X]
+    assert graph(scoped).independent_ex([X], "attest:eval", 1)[0] == []
+
+
+def test_exact_independence_gives_up_cleanly_when_the_search_is_too_big(monkeypatch):
+    from torrenthub import trust as T
+
+    monkeypatch.setattr(T, "INDEPENDENT_BUDGET", 3)
+    # Ten keys that all share one voucher and one backup route each: needs real search to prove 4 is impossible.
+    evs = [endorse(1, 2, w=0.9), endorse(1, 3, w=0.9)] + [endorse(2, n, w=0.9, delegable=False) for n in range(20, 30)]
+    evs += [endorse(3, n, w=0.8, delegable=False) for n in range(20, 30)]
+    got, exact = graph(evs).independent_ex([pub(n) for n in range(20, 30)], None, 4)
+    assert not exact and 1 <= len(got) <= 2
+
+
+def _brute_best(g, keys, scope, minimum):
+    """Reference answer by plain enumeration, written separately from the implementation."""
+    paths = {}
+    for k in keys:
+        out = []
+
+        def walk(node, prod, edges, mids):
+            # node is where the path currently ends, walking forward from a root
+            if node == k:
+                if prod > minimum:
+                    out.append(frozenset(mids))
+                return
+            if len(edges) >= g.hops:
+                return
+            for e in g.endorsements:
+                if e.issuer != node or e.subject in mids or not T_covers(e.scope, scope):
+                    continue
+                nxt_last = e.subject == k
+                if not nxt_last and not e.delegable:
+                    continue
+                walk(e.subject, prod * e.weight, edges + [e.id], mids | ({e.subject} if not nxt_last else set()))
+
+        if k in g.roots:
+            out.append(frozenset())
+        else:
+            for r in sorted(g.roots):
+                walk(r, 1.0, [], set())
+        paths[k] = out
+
+    best = 0
+
+    def pick(i, used, count):
+        nonlocal best
+        best = max(best, count)
+        if i == len(keys):
+            return
+        pick(i + 1, used, count)
+        for m in paths[keys[i]]:
+            mine = m | {keys[i]}
+            if not (mine & used):
+                pick(i + 1, used | mine, count + 1)
+
+    pick(0, frozenset(), 0)
+    return best
+
+
+def T_covers(patterns, scope):
+    from torrenthub.trust import covers
+
+    return covers(patterns, scope)
+
+
+@pytest.mark.parametrize("seed", range(25))
+def test_exact_independence_matches_brute_force_on_random_graphs(seed):
+    rng = random.Random(seed)
+    nodes = list(range(2, 10))
+    evs = []
+    for _ in range(rng.randint(8, 20)):
+        a, b = rng.choice([1] + nodes), rng.choice(nodes)
+        if a != b:
+            evs.append(endorse(a, b, w=rng.choice([0.4, 0.7, 0.9]), delegable=rng.random() < 0.7, at=100 + len(evs)))
+    g = graph(evs, hops=rng.choice([2, 3]))
+    keys = sorted(pub(n) for n in nodes)
+    minimum = rng.choice([0.0, 0.3])
+    want = _brute_best(g, keys, None, minimum)
+    got, exact = g.independent_ex(keys, None, len(keys), minimum)
+    assert exact
+    assert len(got) == want, f"seed {seed}: exact {len(got)}, brute force {want}"
+    assert len(got) >= len(g.independent_greedy(keys, None, len(keys), minimum))

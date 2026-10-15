@@ -7,7 +7,7 @@ import os
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "events-add", "events-pull", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -46,16 +46,24 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--target", required=True, help="event id, public key (hex or npub), or sha256")
     sp.add_argument("--reason", default="")
     sp.add_argument("--taint", action="store_true", help="things derived from a revoked blob are affected too")
+    sp.add_argument("--successor", help="with --kind key: rotate to this key, which inherits the old key's incoming trust")
 
     sp = sub.add_parser("events-add", help="check an event file and add it to this gateway's event store")
     sp.add_argument("file")
 
     sp = sub.add_parser("events-pull", help="fetch events from another gateway and add the ones that pass")
     sp.add_argument("url")
-    sp.add_argument("--kinds", default="36778,36779,36780,36781")
+    sp.add_argument("--kinds", default="36778,36779,36780,36781,36782")
     sp.add_argument("--author", action="append")
     sp.add_argument("--since", type=int)
     sp.add_argument("--limit", type=int, default=500)
+
+    sp = sub.add_parser("events-sync", help="level this gateway's events with another's: pull what it has, push what it lacks")
+    sp.add_argument("url")
+    sp.add_argument("--kinds", default="36778,36779,36780,36781,36782")
+    g = sp.add_mutually_exclusive_group()
+    g.add_argument("--pull-only", action="store_true")
+    g.add_argument("--push-only", action="store_true")
 
     sp = sub.add_parser("events", help="list events held here")
     sp.add_argument("--kind", type=int, action="append")
@@ -134,7 +142,8 @@ def run_event_command(args, settings, p) -> None:
             _emit(build_endorsement(_secret(args, p), key(args.subject), args.scope, args.weight, delegable=args.delegable, expires=exp), args.out)
         elif c == "revoke":
             target = key(args.target) if args.kind == "key" else args.target
-            _emit(build_revocation(_secret(args, p), args.kind, target, args.reason, taint=args.taint), args.out)
+            succ = key(args.successor) if args.successor else None
+            _emit(build_revocation(_secret(args, p), args.kind, target, args.reason, taint=args.taint, successor=succ), args.out)
         elif c == "signer":
             import asyncio
 
@@ -199,7 +208,7 @@ def run_event_command(args, settings, p) -> None:
                     if out:
                         deliver([out])
             print(json.dumps(tally))
-        elif c in ("events-add", "events-pull", "events", "trust", "verdict"):
+        elif c in ("events-add", "events-pull", "events-sync", "events", "trust", "verdict"):
             store = EventStore(settings.data_dir)
             adm = Admission(store, settings.roots, hops=settings.trust_hops)
             if c == "events-add":
@@ -222,6 +231,11 @@ def run_event_command(args, settings, p) -> None:
                     st = adm.admit(ev).status
                     tally[st] = tally.get(st, 0) + 1
                 print(json.dumps(tally))
+            elif c == "events-sync":
+                from .sync import sync
+
+                kinds = [int(k) for k in args.kinds.split(",") if k]
+                print(json.dumps(sync(adm, args.url, kinds, pull=not args.push_only, push=not args.pull_only)))
             elif c == "verdict":
                 g = adm.graph()
                 v = g.verdict(args.sha256, args.claim, args.independent, args.min_trust)

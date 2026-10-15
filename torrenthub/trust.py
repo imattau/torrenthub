@@ -18,7 +18,7 @@ the graph that is left, revocations by keys the consumer trusts for scope "revok
 from __future__ import annotations
 
 import fnmatch
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .events import (
     DELEGATION, ENDORSEMENT, IDENTITY, REVOCATION, Attestation, Delegation, Endorsement, EventInvalid, Identity, Revocation,
@@ -27,6 +27,9 @@ from .events import (
 
 DEFAULT_HOPS = 3
 MAX_DELEGATION_DEPTH = 4
+MAX_ROTATIONS = 8  # longest chain of key rotations followed
+INDEPENDENT_BUDGET = 200_000  # search steps before independent_ex gives up on exactness
+MAX_PATH_SETS = 256  # distinct intermediate-key sets kept per key
 
 
 def covers(patterns, scope: str | None) -> bool:
@@ -83,11 +86,11 @@ class Graph:
         self.revoked_events: set[str] = set()
         self.revoked_keys: set[str] = set()
         self.revoked_x: dict[str, bool] = {}
+        self.successors: dict[str, str] = {}
         self._apply_revocations()
-        self.endorsements = [e for e in ids.values() if isinstance(e, Endorsement) and self._live(e.id, e.issuer, e.expires, 0)
-                             and e.subject not in self.revoked_keys]
-        self.delegations = [d for d in ids.values() if isinstance(d, Delegation) and self._live(d.id, d.issuer, d.expires, d.not_before)
-                            and d.subject not in self.revoked_keys]
+        self.endorsements = self._inherit([e for e in ids.values() if isinstance(e, Endorsement) and self._live(e.id, e.issuer, e.expires, 0)])
+        self.delegations = self._inherit([d for d in ids.values() if isinstance(d, Delegation)
+                                          and self._live(d.id, d.issuer, d.expires, d.not_before)])
         self._edges: dict[str, list[Endorsement]] = {}
         for e in sorted(self.endorsements, key=lambda e: e.id):
             self._edges.setdefault(e.issuer, []).append(e)
@@ -95,6 +98,7 @@ class Graph:
         for d in sorted(self.delegations, key=lambda d: d.id):
             self._dels.setdefault(d.issuer, []).append(d)
         self._cache: dict = {}
+        self._rev = None
         self.attestations = [a for a in ids.values() if isinstance(a, Attestation)
                              and a.id not in self.revoked_events and a.issuer not in self.revoked_keys]
         self._by_subject: dict[tuple, list[Attestation]] = {}
@@ -112,6 +116,34 @@ class Graph:
         i = self.identities.get(key)
         return i.recovery if i else None
 
+    def successor_of(self, key: str) -> str | None:
+        """The key that took over a rotated key's standing, following a chain of rotations. None if
+        the key was not rotated, the chain loops, or it ends at a key that is itself revoked."""
+        seen = {key}
+        cur = self.successors.get(key)
+        while cur is not None:
+            if cur in seen or len(seen) > MAX_ROTATIONS:
+                return None
+            seen.add(cur)
+            nxt = self.successors.get(cur)
+            if nxt is None:
+                return None if cur in self.revoked_keys else cur
+            cur = nxt
+        return None
+
+    def _inherit(self, items):
+        """Drop edges that point at a revoked key, except that edges to a rotated key now point at
+        its successor. Edges the old key issued stay dead: the successor has to issue its own."""
+        out = []
+        for it in items:
+            if it.subject in self.revoked_keys:
+                succ = self.successor_of(it.subject)
+                if succ is None or succ in self.revoked_keys:
+                    continue
+                it = replace(it, subject=succ)
+            out.append(it)
+        return out
+
     def _live(self, eid: str, issuer: str, expires, not_before) -> bool:
         if eid in self.revoked_events or issuer in self.revoked_keys:
             return False
@@ -123,6 +155,7 @@ class Graph:
         revs = sorted((p for p in self.parsed.values() if isinstance(p, Revocation)), key=lambda r: (r.created_at, r.id))
         # Pass 1: the issuer of an event, a key itself, or a key's declared recovery key.
         later: list[Revocation] = []
+        rotations: dict[str, list[tuple[bool, Revocation]]] = {}
         for r in revs:
             if r.target_kind == "event":
                 t = self.parsed.get(r.target)
@@ -133,18 +166,30 @@ class Graph:
             elif r.target_kind == "key":
                 if r.issuer == r.target or self.recovery_of(r.target) == r.issuer:
                     self.revoked_keys.add(r.target)
+                    if r.successor:
+                        rotations.setdefault(r.target, []).append((r.issuer != r.target, r))
                 else:
                     later.append(r)
             else:
                 later.append(r)
+        # Rotation. If the old key declared a recovery key, only the recovery key can hand its
+        # standing on, so a thief holding the old key cannot name itself successor. Otherwise the
+        # key can. The earliest valid statement wins. created_at is the signer's own clock, so a
+        # thief of an unprotected key can backdate; that case is not fixable here (PROTOCOL.md 3.1).
+        for old, cands in rotations.items():
+            if self.recovery_of(old):
+                cands = [c for c in cands if c[0]]
+            if cands:
+                self.successors[old] = min((c[1] for c in cands), key=lambda r: (r.created_at, r.id)).successor
         # Pass 2: keys this consumer trusts for the scope "revoke", judged on what pass 1 left.
         if not later:
             return
         base = Graph.__new__(Graph)
         base.roots, base.now, base.hops, base.parsed, base.identities = self.roots, self.now, self.hops, self.parsed, self.identities
         base.revoked_events, base.revoked_keys, base.revoked_x = set(self.revoked_events), set(self.revoked_keys), {}
-        base.endorsements = [e for e in self.parsed.values() if isinstance(e, Endorsement) and base._live(e.id, e.issuer, e.expires, 0)
-                             and e.subject not in base.revoked_keys]
+        base.successors = self.successors
+        base.endorsements = base._inherit([e for e in self.parsed.values() if isinstance(e, Endorsement)
+                                           and base._live(e.id, e.issuer, e.expires, 0)])
         base._edges = {}
         for e in sorted(base.endorsements, key=lambda e: e.id):
             base._edges.setdefault(e.issuer, []).append(e)
@@ -229,10 +274,62 @@ class Graph:
         return bool(self.trust(key, None)) or any(self.delegation_chain(r, key, None) for r in sorted(self.roots))
 
     def independent(self, keys, scope: str | None, n: int, minimum: float = 0.0) -> list[str]:
-        """Pick up to n keys, each with trust above `minimum`, whose best paths share no intermediate
-        key and none of which sits on another's path. Greedy, best trust first. Returns the keys
-        chosen. n of them means the requirement is met. The result is a lower bound: an exact
-        answer would need a max flow computation."""
+        """Up to n keys, each with a trust path above `minimum`, such that the paths can be chosen
+        to share no intermediate key and none of the keys sits on another's path. n keys back means
+        the requirement is met. See independent_ex for whether the answer is exact."""
+        return self.independent_ex(keys, scope, n, minimum)[0]
+
+    def independent_ex(self, keys, scope: str | None, n: int, minimum: float = 0.0) -> tuple[list[str], bool]:
+        """Like independent, and says whether the search finished. It looks at every admissible
+        path of each key (hop limit, delegable edges, scope and weight all respected), not just the
+        best one, and finds the largest set with pairwise disjoint paths by branch and bound. If
+        that takes more than INDEPENDENT_BUDGET steps it stops and returns the better of what it
+        has and the greedy answer, with exact False. Greedy never beats the exact answer, so the
+        exact answer is at least as large as the old one."""
+        greedy = self.independent_greedy(keys, scope, n, minimum)
+        if len(greedy) >= n:
+            return greedy, True  # nothing can beat n
+        cands: dict[str, list[frozenset]] = {}
+        for k in sorted(set(keys)):
+            sets = self._path_sets(k, scope, minimum)
+            if sets:
+                cands[k] = sets
+        order = sorted(cands, key=lambda k: (-self.trust(k, scope).value, k))
+        best: list[str] = []
+        budget = [INDEPENDENT_BUDGET]
+        exact = True
+
+        def rec(i: int, used: frozenset, chosen: list[str]) -> bool:
+            """True when the search should stop (n found or budget gone)."""
+            nonlocal best, exact
+            if len(chosen) > len(best):
+                best = chosen[:]
+                if len(best) >= n:
+                    return True
+            if i >= len(order) or len(chosen) + (len(order) - i) <= len(best):
+                return False
+            budget[0] -= 1
+            if budget[0] <= 0:
+                exact = False
+                return True
+            k = order[i]
+            for mids in cands[k]:
+                mine = mids | {k}
+                if not (mine & used):
+                    chosen.append(k)
+                    stop = rec(i + 1, used | mine, chosen)
+                    chosen.pop()
+                    if stop:
+                        return True
+            return rec(i + 1, used, chosen)  # or leave this key out
+
+        rec(0, frozenset(), [])
+        if len(greedy) > len(best):
+            best = greedy
+        return best[:n], exact
+
+    def independent_greedy(self, keys, scope: str | None, n: int, minimum: float = 0.0) -> list[str]:
+        """Best trust first, each key's single best path. A lower bound on independent()."""
         scored = []
         for k in sorted(set(keys)):
             t = self.trust(k, scope)
@@ -251,6 +348,48 @@ class Graph:
             if len(chosen) == n:
                 break
         return chosen
+
+    def _path_sets(self, key: str, scope: str | None, minimum: float) -> list[frozenset]:
+        """The intermediate keys of every admissible root-to-`key` path, smallest first, dropping
+        any set that contains another (it can only be worse). Admissible means what trust() means:
+        within the hop limit, every edge covers the scope, every edge but the last is delegable,
+        and the product of weights is above `minimum`."""
+        ck = ("paths", key, scope, minimum)
+        if ck in self._cache:
+            return self._cache[ck]
+        if self._rev is None:
+            rev: dict[str, list[Endorsement]] = {}
+            for e in self.endorsements:
+                rev.setdefault(e.subject, []).append(e)
+            self._rev = rev
+        found: set[frozenset] = set()
+
+        def back(node: str, prod: float, depth: int, mids: frozenset, first: bool) -> None:
+            for e in self._rev.get(node, ()):
+                if not covers(e.scope, scope) or (not first and not e.delegable):
+                    continue
+                p = prod * e.weight
+                if p <= minimum:
+                    continue
+                u = e.issuer
+                if u in self.roots:
+                    if u not in self.revoked_keys:
+                        found.add(mids)
+                    continue
+                if depth + 1 < self.hops and u != key and u not in mids:
+                    back(u, p, depth + 1, mids | {u}, False)
+
+        if key in self.roots:
+            found.add(frozenset()) if key not in self.revoked_keys else None
+        elif key not in self.revoked_keys:
+            back(key, 1.0, 0, frozenset(), True)
+        out: list[frozenset] = []
+        for m in sorted(found, key=lambda m: (len(m), sorted(m))):
+            if not any(o <= m for o in out):
+                out.append(m)
+        out = out[:MAX_PATH_SETS]
+        self._cache[ck] = out
+        return out
 
     # ------------------------------------------------------------- delegation
     def delegation_chain(self, root: str, signer: str, scope: str | None):

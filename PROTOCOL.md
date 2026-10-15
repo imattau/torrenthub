@@ -58,7 +58,7 @@ A change to an event's fields that old readers cannot parse bumps its content `v
 References to content use the tag names NIP-94 (file metadata) already uses, so existing tools can read them: `x` is a sha256 of a file, `i` is a torrent infohash, `magnet` is an optional magnet URI. References to other events use `e`. `content` is ASCII JSON with a version field, as the manifest already is.
 
 ### 3.1 `identity`
-Key, optional recovery key, label, optional contact or operator note. `supersedes` points to an older identity event of the same key or of a key whose recovery key signs this. Only the first identity event of a key is taken on trust by anyone. After that, a change needs the old key or its declared recovery key.
+Key, optional recovery key, label, optional contact or operator note. `supersedes` points to an older identity event of the same key or of a key whose recovery key signs this. Only the first identity event of a key is taken on trust by anyone. After that, a change needs the old key or its declared recovery key. Moving a key's standing to a new key is done with a `revocation` that names a `successor` (section 3.7), not with this event.
 
 ### 3.2 `manifest` (exists)
 A repo's file table at a commit, signed by the namespace owner. v2 adds `seq` (strictly increasing per repo and ref), `valid_until` (optional), and `files_x`/`files_i` to move a large table into a blob.
@@ -87,7 +87,7 @@ A statement about a subject (`x` blob or `e` event). Claim types and classes:
 The class is a function of the claim type and is not written by the author. Fields: `claim`, `method` (tool and tool hash), `result`, `evidence` (an `x` and `i` for a file with outputs that others can check).
 
 ### 3.7 `revocation`
-Target is an event id, a blob `x`, a key, or a delegation or endorsement. Fields: `reason`, `severity`, `taint` (true means descendants of a blob count as affected). Valid from the target's issuer, from the namespace owner for things in the namespace, or from a key the consumer trusts for scope `revoke`.
+Target is an event id, a blob `x`, a key, or a delegation or endorsement. Fields: `reason`, `severity`, `taint` (true means descendants of a blob count as affected), and for a key target an optional `successor`. A revocation with a successor is a key rotation: the old key is revoked, and the endorsements and delegations that pointed at it now point at the successor. What the old key issued stays revoked; the successor issues its own. If the old key declared a recovery key, only the recovery key can name the successor, so a thief holding the old key cannot. If it declared none, the key can name it. The earliest valid statement wins, and a consumer's own roots are never replaced this way. Valid from the target's issuer, from the namespace owner for things in the namespace, or from a key the consumer trusts for scope `revoke`.
 
 ### 3.8 `request`, `claim`, `result`
 Request: task type, inputs by hash, a spec hash, deadline, optional reward pointer. Claim: advisory "I am working on request `e`". Result: an artifact or attestation event referencing the request. A requester judges results by its own policy, usually by replication. NIP-90 (data vending machines) covers similar ground but the NIPs README marks it unrecommended, so this is its own small design, kept small on purpose.
@@ -116,7 +116,7 @@ Nodes are keys. Edges are unexpired, unrevoked endorsements from truster to subj
 
 `trust(K, scope)` is the largest product of edge weights over any path from a root to K such that every edge covers `scope`, every edge except the last is `delegable`, and the path has at most H hops (default 3). Roots have trust 1. Because weights are below 1, trust falls with distance. It is computed by best-first search and is deterministic: the same events give the same answer in any order. The result carries the path, so any decision can be explained.
 
-Independence for `independent(n)`: take the qualifying attestors and choose the best path for each. Two are independent if their paths share no intermediate key. The first version does this greedily. A max flow method would be exact, and is a later improvement.
+Independence for `independent(n)`: take the qualifying attestors and choose the best path for each. Two are independent if their paths share no intermediate key. The search considers every admissible path of each attestor (hop limit, delegable edges, scope and weight all respected) and finds the largest set whose paths share no intermediate key, by branch and bound. Plain max flow does not fit because of the hop limit and the weight threshold. If the search passes a step budget it stops, says the answer is not exact, and returns at least the greedy answer.
 
 Properties this is meant to have, each of which becomes a test:
 - Keys with no path from your roots have trust 0, however many there are or what they say about each other.
@@ -183,7 +183,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 |---|---|---|
 | V | Run the validation kit on real Hugging Face and real machines | Probe passes (including Xet backed repos), live test matches, peers find each other, peer share is worth having |
 | P0 (passed 2026-10-16: approved, decisions in `ARCHITECTURE.md` section 11) | Review this document. Assign kind numbers after rechecking the registry. Policy format decided (section 11). | You approve, open questions in section 11 answered |
-| P1 (partly built, section 12) | Generalise to an event store and API. Identity, delegation, endorsement and revocation events. The trust evaluator and policy engine. CLI. Admission control. | The simulation tests in section 9 pass, including order independence and the sybil and collusion cases, with timings for a large event set |
+| P1 (built, section 12; the rules that need derivations or manifest v2 wait for P3 and P4) | Generalise to an event store and API. Identity, delegation, endorsement and revocation events. The trust evaluator and policy engine. CLI. Admission control. | The simulation tests in section 9 pass, including order independence and the sybil and collusion cases, with timings for a large event set |
 | P2 (built, section 13) | Attestations: `hash_verified` and `format_scan`, a verifier agent, replication events, `independent(n)`, a signer process, and the MCP write tools (read and download tools already exist, M0) | A verifier agent publishes, a consumer policy changes behaviour because of it, and a bad attestor is caught by replication |
 | P3 | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |
 | P4 | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
@@ -220,11 +220,16 @@ Code: `events.py`, `trust.py`, `eventstore.py`, `admission.py`, `cli_events.py`,
 **Not built**
 - The policy file (section 4 and decision 1 in section 11). `THUB_TRUST` and `THUB_ROOTS` still do this job.
 - Attestation, derivation, request, claim and result events, `independent(n)` as a policy rule (the function exists in `trust.py`), taint reaching descendants (needs derivations), manifest v2.
-- Key rotation by identity supersession. An identity event can name a recovery key, which can revoke the old key, but there is no event that moves a key's standing to a new key.
-- Event sync between hubs beyond `events-pull`, which pulls on demand. No gossip, no push, no relay.
-- Exact independence (max flow). The greedy version gives a lower bound.
+- Policy rules that need other phases: `max synthetic_depth`, `on tainted` and `accept tools` need derivations (P3); `max_age` needs manifest v2 (P4). `identity` events carry a `supersedes` tag that nothing reads; rotation uses the revocation's `successor` instead.
+- Gossip, automatic push and relays. Sync is on demand.
+
+**Added after the first slice (2026-10-16)**
+- Key rotation: `torrenthub revoke --kind key --target OLD --successor NEW`, signed by the old key or its recovery key. Rules in section 3.7. Chains of rotations are followed up to 8 deep, loops and revoked successors inherit nothing, and the answer does not depend on event order. A thief of a key with no declared recovery key can still rotate it to themselves, and can backdate (`created_at` is the signer's own clock). The protocol cannot fix that; declare a recovery key.
+- Exact independence (section 5), checked against a separate brute force on random graphs. On a 9,000 event graph with 500 trusted keys, asking for 2 to 50 independent attestors answers exactly in under 10 ms. Asking for more than can exist runs out of budget after about 0.13 s and reports not exact.
+- `torrenthub events-sync URL [--pull-only|--push-only]` (`sync.py`): pulls what the peer has, admitting trust edges first, then pushes the main-tier events the peer lacks. Every event is checked again on admission at the receiving end. An event whose author is not yet a member is quarantined and promoted when the author joins, so two hubs may need a few rounds to settle. Only the main tier travels. `events-pull` now includes attestations by default.
 
 **Known limits**
+- Sync pages with `until`, which is inclusive. More than 500 events in one second from one peer would stall the walk. Nothing has been synced between hubs on separate machines.
 - Signature checks are pure Python, about 20 ms each on the machine used here. Admission checks each event once, so a hub handles roughly 50 new events a second per core at best. Stored events are not checked again when the graph is rebuilt. A compiled secp256k1 library would be much faster and is not used.
 - The graph is rebuilt from the whole `main` tier whenever it changes. A timing test with about 9,000 unsigned stand in events (3,000 keys, 500 of them trusted) builds the graph in about 0.1 s and answers a trust query for every key in about 0.3 s in total. I have not tested a graph from real participants.
 - A key that is revoked has all its past and future edges ignored, with no regard to dates. That is simple and safe, and it also means an honest early record from a compromised key disappears.
