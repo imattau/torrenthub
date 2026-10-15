@@ -7,10 +7,12 @@ unsafe constructs this code knows to look for. It does not find every bad file.
 Formats:
   .safetensors     header parses, tensors are contiguous and fill the file exactly, sizes agree
                    with dtype and shape for the dtypes known here
-  pickle based     (.bin .pt .pth .ckpt .pkl .pickle .joblib) the pickle is read opcode by opcode,
-                   never run. Every global it asks for must be on a short list of tensor
-                   rebuild functions. Anything else, or a global that cannot be worked out,
-                   fails the scan.
+  pickle based     (.bin .pt .pth .ckpt .pkl .pickle .joblib) the file is run through the real
+                   unpickler, so its own bookkeeping decides what gets imported, with every import
+                   routed to one function that returns inert stand-ins and notes any name outside a
+                   short list of tensor rebuild functions. Nothing is imported or called for real.
+                   Every pickle a loader would read is scanned: all the entries of a zip, and up to
+                   five in a row in an older file. Anything unreadable fails the scan.
   .gguf            magic and version only. That is a weak check and the tool name says so.
 Other files get no format_scan.
 """
@@ -19,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import pickletools
+import pickle
 import struct
 import zipfile
 from pathlib import Path
@@ -28,7 +30,7 @@ from . import events as E
 from .store import Store
 
 TOOL_ST = "thub-scan-safetensors/1"
-TOOL_PICKLE = "thub-scan-pickle/1"
+TOOL_PICKLE = "thub-scan-pickle/2"
 TOOL_GGUF = "thub-scan-gguf-magic/1"
 TOOL_HASH = "thub-sha256/1"
 
@@ -106,73 +108,157 @@ def scan_safetensors(path: Path) -> tuple[bool, str]:
     return True, f"{len(spans)} tensors"
 
 
-def _pickle_globals(fobj) -> tuple[set[tuple[str, str]], bool]:
-    """(globals the pickle asks for, whether any could not be worked out). Reads opcodes only."""
-    found: set[tuple[str, str]] = set()
-    unresolved = False
-    strings: list = []  # strings pushed, most recent last
-    memo: dict = {}
-    last = None
-    next_memo = 0
-    for op, arg, _pos in pickletools.genops(fobj):
-        n = op.name
-        if n in ("SHORT_BINUNICODE", "BINUNICODE", "BINUNICODE8", "UNICODE", "SHORT_BINSTRING", "BINSTRING", "STRING"):
-            last = arg if isinstance(arg, str) else None
-            strings.append(last)
-        elif n in ("BINGET", "LONG_BINGET", "GET"):
-            last = memo.get(arg)
-            strings.append(last)
-        elif n == "MEMOIZE":
-            memo[next_memo] = last
-            next_memo += 1
-        elif n in ("BINPUT", "LONG_BINPUT", "PUT"):
-            memo[arg] = last
-        elif n == "GLOBAL":
-            mod, _, name = str(arg).partition(" ")
-            found.add((mod, name))
-            last = None
-        elif n == "STACK_GLOBAL":
-            if len(strings) >= 2 and strings[-1] and strings[-2]:
-                found.add((strings[-2], strings[-1]))
-            else:
-                unresolved = True
-            last = None
-        else:
-            last = None
-    return found, unresolved
-
-
 def _global_ok(mod: str, name: str) -> bool:
     if (mod, name) in SAFE_GLOBALS:
         return True
     return mod == "torch" and (name.endswith("Storage") or name in SAFE_TORCH_NAMES)
 
 
+MAX_PICKLE_BYTES = 512 * 1024 * 1024   # most of a file, or of a zip entry, that is read as pickle data
+MAX_SEQUENTIAL_PICKLES = 5             # an older torch file holds this many pickles one after another
+
+
+class _TooBig(Exception):
+    pass
+
+
+class _Inert:
+    """Stands in for every global a pickle asks for. It accepts whatever the pickle machine does to
+    an object (call it, set its state, append to it) and does nothing, so no real code runs."""
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __call__(self, *args, **kwargs):
+        return _Inert()
+
+    def __setstate__(self, state):
+        pass
+
+    def __setitem__(self, key, value):
+        pass
+
+    def append(self, *args):
+        pass
+
+    def extend(self, *args):
+        pass
+
+    def add(self, *args):
+        pass
+
+    def update(self, *args, **kwargs):
+        pass
+
+
+class _Seen:
+    def __init__(self):
+        self.imports: set[tuple[str, str]] = set()
+        self.bad: set[tuple[str, str]] = set()
+
+
+def _unpickler(f, seen: _Seen) -> pickle.Unpickler:
+    class Restricted(pickle.Unpickler):
+        def find_class(self, module, name):  # every import the pickle machine can make comes through here
+            seen.imports.add((str(module), str(name)))
+            if not _global_ok(str(module), str(name)):
+                seen.bad.add((str(module), str(name)))
+            return _Inert
+
+        def persistent_load(self, pid):
+            return _Inert()
+
+    return Restricted(f, fix_imports=False, encoding="latin1", errors="replace")
+
+
+class _Capped:
+    """Reads from a file object but never more than `left` bytes in all."""
+
+    def __init__(self, f, left: int = MAX_PICKLE_BYTES):
+        self.f, self.left = f, left
+
+    def _ask(self, n) -> int:
+        """How many bytes to request. A request for no particular amount gets one byte more than
+        the cap allows, so that running into the cap is noticed."""
+        if n is None or n < 0:
+            return self.left + 1
+        if n > self.left:
+            raise _TooBig
+        return n
+
+    def _took(self, data: bytes) -> bytes:
+        if len(data) > self.left:
+            raise _TooBig
+        self.left -= len(data)
+        return data
+
+    def read(self, n=-1):
+        return self._took(self.f.read(self._ask(n)))
+
+    def readline(self, n=-1):
+        return self._took(self.f.readline(self._ask(n)))
+
+    def readinto(self, buf):
+        data = self._took(self.f.read(self._ask(len(buf))))
+        buf[:len(data)] = data
+        return len(data)
+
+
+def _scan_stream(f, seen: _Seen, *, sequential: bool) -> None:
+    """Run the restricted unpickler over what a loader would read from `f`. The first pickle must
+    be readable. Later ones (older torch files) are scanned while they parse; once something that
+    is not a pickle follows, the rest is tensor data. Names noticed before a failure still count."""
+    reader = _Capped(f)
+    for count in range(MAX_SEQUENTIAL_PICKLES if sequential else 1):
+        try:
+            _unpickler(reader, seen).load()
+        except _TooBig:
+            raise
+        except EOFError:
+            if count == 0:
+                raise
+            return
+        except Exception:  # noqa: BLE001  (a malformed pickle can raise nearly anything)
+            if count == 0:
+                raise
+            return
+
+
 def scan_pickle(path: Path) -> tuple[bool, str]:
+    seen = _Seen()
     try:
-        globs: set[tuple[str, str]] = set()
-        unresolved = False
+        with open(path, "rb") as probe:
+            head = probe.read(4)
         if zipfile.is_zipfile(path):
+            if head[:4] not in (b"PK\x03\x04", b"PK\x05\x06"):
+                return False, "ambiguous: a zip archive that does not start like one, so loaders may read it as something else"
             with zipfile.ZipFile(path) as zf:
-                pkls = [n for n in zf.namelist() if n.endswith(".pkl")]
+                infos = zf.infolist()
+                names = [i.filename for i in infos]
+                if len(set(names)) != len(names):
+                    return False, "zip archive has two entries with the same name"
+                pkls = [i for i in infos if i.filename.endswith(".pkl")]
                 if not pkls:
                     return False, "zip archive holds no pickle to check"
-                for n in pkls:
-                    with zf.open(n) as f:
-                        g, u = _pickle_globals(f)
-                    globs |= g
-                    unresolved |= u
+                for info in pkls:
+                    if info.file_size > MAX_PICKLE_BYTES:
+                        return False, f"pickle {info.filename!r} is larger than the {MAX_PICKLE_BYTES} byte scan limit"
+                    with zf.open(info) as f:
+                        _scan_stream(f, seen, sequential=False)
         else:
             with open(path, "rb") as f:
-                globs, unresolved = _pickle_globals(f)
-    except (ValueError, EOFError, zipfile.BadZipFile, OSError, MemoryError, KeyError) as e:
+                _scan_stream(f, seen, sequential=True)
+    except _TooBig:
+        return False, f"more than {MAX_PICKLE_BYTES} bytes of pickle data; not scanned"
+    except Exception as e:  # noqa: BLE001
         return False, f"cannot read as a pickle: {type(e).__name__}"
-    bad = sorted(f"{m}.{n}" for m, n in globs if not _global_ok(m, n))
+    bad = sorted(f"{m}.{n}" for m, n in seen.bad)
     if bad:
         return False, "asks the loader to import: " + ", ".join(bad[:6])
-    if unresolved:
-        return False, "asks for an import that could not be worked out"
-    return True, f"{len(globs)} known tensor rebuild imports"
+    return True, f"{len(seen.imports)} known tensor rebuild imports"
 
 
 def scan_gguf(path: Path) -> tuple[bool, str]:
