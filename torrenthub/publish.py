@@ -34,7 +34,7 @@ from .manifest import Manifest, ManifestInvalid, content_commit, verify_manifest
 from .metrics import Metrics
 from .store import BlobRow, FileRec, Store
 from .swarm import Swarm
-from .torrent import TorrentRejected, bdecode, infohash_from_torrent, validate_torrent, with_webseeds
+from .torrent import TorrentRejected, bdecode, infohash_from_torrent, sanitize_torrent, validate_torrent
 from .trust import Graph
 
 log = logging.getLogger("torrenthub.publish")
@@ -196,9 +196,11 @@ class Ingest:
                     raise PublishError(400, "NoSwarm", f"{path} needs a swarm transfer and this hub has no swarm; send it inline if small")
                 try:
                     validate_torrent(torrents[x], x, size)
+                    # The publisher's torrent is used for the info dictionary only. The hub contacts
+                    # no tracker for it: the publisher connects in.
+                    need_swarm[x] = (sanitize_torrent(torrents[x]), size)
                 except TorrentRejected as e:
                     raise PublishError(400, "BadTorrent", f"{path}: {e}") from e
-                need_swarm[x] = (torrents[x], size)
             else:
                 raise PublishError(400, "MissingContent", f"{path}: send its bytes inline or its torrent")
             new_bytes += size
@@ -306,7 +308,7 @@ class Ingest:
             path.unlink(missing_ok=True)
             self.metrics.inc("thub_integrity_failures_total", source="publish")
             raise PublishError(400, "ContentMismatch", f"{job.files[x]['path']}: what arrived is not the signed sha256")
-        meta = with_webseeds(tbytes, [f"{self.s.public_url}/blobs/{x}"])
+        meta = sanitize_torrent(tbytes, self.s.trackers, [f"{self.s.public_url}/blobs/{x}"])
         self.store.torrent_path(x).write_bytes(meta)
         self.store.put_blob(BlobRow(x, size, x, "complete", infohash_from_torrent(tbytes), bdecode(tbytes)[b"info"][b"piece length"], time.time()))
         job.files[x]["state"] = "stored"

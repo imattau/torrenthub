@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import fnmatch
 import hashlib
+import json
 import mimetypes
 import time
 from contextlib import asynccontextmanager
@@ -221,6 +222,64 @@ def inflight_response(
     )
 
 
+# ------------------------------------------------------------ request size limits
+
+class _TooLarge(Exception):
+    pass
+
+
+class BodyLimit:
+    """Refuse a request body over the limit for its path before it is read into memory.
+
+    Every POST endpoint here parses JSON, and a framework reads the whole body first. Without a cap
+    one unauthenticated client can cost the gateway hundreds of megabytes and seconds of CPU per
+    request. A declared Content-Length over the limit is refused at once; a body that is streamed
+    (chunked, or lying about its length) is cut off when it passes the limit."""
+
+    def __init__(self, app, limits: dict[str, int]):
+        self.app, self.limits = app, limits
+
+    async def __call__(self, scope, receive, send):
+        limit = None
+        if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "PATCH"):
+            limit = next((n for prefix, n in self.limits.items() if scope["path"].startswith(prefix)), None)
+        if limit is None:
+            return await self.app(scope, receive, send)
+        declared = next((v for k, v in scope["headers"] if k == b"content-length"), None)
+        if declared is not None and declared.isdigit() and int(declared) > limit:
+            return await self._refuse(send, limit)
+        seen = 0
+        started = False
+
+        async def counting_receive():
+            nonlocal seen
+            msg = await receive()
+            if msg["type"] == "http.request":
+                seen += len(msg.get("body", b""))
+                if seen > limit:
+                    raise _TooLarge
+            return msg
+
+        async def tracking_send(msg):
+            nonlocal started
+            started = started or msg["type"] == "http.response.start"
+            await send(msg)
+
+        try:
+            await self.app(scope, counting_receive, tracking_send)
+        except _TooLarge:
+            if not started:
+                await self._refuse(send, limit)
+
+    @staticmethod
+    async def _refuse(send, limit: int):
+        body = json.dumps({"error": f"request body is over the {limit} byte limit for this endpoint"}).encode()
+        await send({"type": "http.response.start", "status": 413, "headers": [
+            (b"content-type", b"application/json"), (b"content-length", str(len(body)).encode()),
+            (b"x-error-code", b"PayloadTooLarge"), (b"connection", b"close")]})
+        await send({"type": "http.response.body", "body": body})
+
+
 # --------------------------------------------------------------------- app
 
 def create_app(
@@ -260,6 +319,7 @@ def create_app(
         await upstream.aclose()
 
     app = FastAPI(title="torrenthub", lifespan=lifespan)
+    app.add_middleware(BodyLimit, limits={"/api/thub/events": settings.max_event_body, "/api/thub/publish": settings.publish_max_body})
     app.state.mirror = mirror
     app.state.ingest = ingest
     app.state.store = store
@@ -361,7 +421,7 @@ def create_app(
     async def post_event(request: Request):
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             return JSONResponse({"error": "body is not JSON"}, status_code=400)
         ev = body.get("event") if isinstance(body, dict) and "event" in body else body
         res = admission.admit(ev)
@@ -414,7 +474,7 @@ def create_app(
         files runs in the background and the publisher watches /api/thub/publish/<job>."""
         try:
             body = await request.json()
-        except ValueError:
+        except (ValueError, RecursionError):
             raise HubError(400, "BadRequest", "body is not JSON") from None
         try:
             out = await ingest.submit(body)

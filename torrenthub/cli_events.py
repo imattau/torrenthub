@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -365,7 +366,11 @@ def run_event_command(args, settings, p) -> None:
 
             async def run():
                 srv = await serve(signer, args.socket)
-                print(json.dumps({"listening": args.socket, "pubkey": signer.pubkey}), flush=True)
+                from .signing import backend as _backend
+
+                print(json.dumps({"listening": args.socket, "pubkey": signer.pubkey, "crypto": _backend()}), flush=True)
+                if _backend() != "libsecp256k1":
+                    print("warning: signing with pure Python, whose timing depends on the secret key; install torrenthub[fast]", file=sys.stderr, flush=True)
                 async with srv:
                     await srv.serve_forever()
 

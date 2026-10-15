@@ -137,6 +137,9 @@ class Settings:
     publish_inline_max: int = 4 * 1024 * 1024  # small files sent in the request itself, in all
     publish_max_files: int = 5000
     publish_max_jobs_per_key: int = 2
+    # Largest request body, in bytes, read for each POST endpoint. An event is capped at 64 KiB by its parser.
+    max_event_body: int = 256 * 1024
+    publish_max_body: int = 64 * 1024 * 1024
     # Keys this gateway pins as roots (hex or npub). Events from keys reachable from a root go in
     # the main event store with a large allowance. Everyone else is quarantined. See PROTOCOL.md.
     roots: list[str] = field(default_factory=list)
@@ -196,6 +199,8 @@ class Settings:
             manifest_max_age=float(e("THUB_MANIFEST_MAX_AGE")) if e("THUB_MANIFEST_MAX_AGE") else None,
             publish_quota=parse_size(e("THUB_PUBLISH_QUOTA"), 0),
             publish_stall=float(e("THUB_PUBLISH_STALL", "120")),
+            max_event_body=parse_size(e("THUB_MAX_EVENT_BODY"), 256 * 1024),
+            publish_max_body=parse_size(e("THUB_PUBLISH_MAX_BODY"), 64 * 1024 * 1024),
             publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),
             roots=parse_keys(e("THUB_ROOTS")),
             trust_hops=int(e("THUB_TRUST_HOPS", "3")),

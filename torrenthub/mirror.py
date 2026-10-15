@@ -41,6 +41,7 @@ from .torrent import (
     build_torrent,
     choose_piece_length,
     infohash_from_torrent,
+    sanitize_torrent,
     strip_webseeds,
     validate_torrent,
 )
@@ -308,7 +309,7 @@ class Mirror:
             data = tp.read_bytes()
             try:
                 validate_torrent(data, key, rec.size)
-                return data
+                return self._clean_torrent(data, key)
             except TorrentRejected:
                 tp.unlink(missing_ok=True)
         if not self.s.swarm_first:
@@ -330,9 +331,20 @@ class Mirror:
             if not rejected:
                 self.metrics.inc("thub_torrent_fetch_total", result="none")
             return None
+        try:
+            data = self._clean_torrent(data, key)
+        except TorrentRejected:
+            self.metrics.inc("thub_torrent_fetch_total", result="rejected")
+            return None
         self.metrics.inc("thub_torrent_fetch_total", result="ok")
         tp.write_bytes(data)
         return data
+
+    def _clean_torrent(self, data: bytes, key: str) -> bytes:
+        """What we keep of a torrent someone else made: its content definition, our trackers, and
+        a web seed only if web seeds are on and then only the upstream hub's own copy."""
+        seeds = [f"{self.upstream.base_url}/blobs/{key}"] if self.s.use_webseeds else []
+        return sanitize_torrent(data, self.s.trackers, seeds)
 
     async def _try_swarm(self, rec: FileRec, path: Path, inf: Inflight) -> bool:
         """Download from peers, streaming the verified prefix. True if the blob is now published.

@@ -242,3 +242,44 @@ def test_pull_from_another_gateway(hub, tmp_path):
     tally = json.loads(p.stdout)
     assert tally == {"accepted": 1}, "only main events are served by default, and they re-check cleanly here"
     assert json.loads(run_cli(tmp_path, "trust", A).stdout)["trust"] > 0
+
+
+# ------------------------------------------------------------------- request size limits
+
+def test_oversize_bodies_are_refused_before_they_are_read(hub):
+    big = b'{"x":"' + b"a" * (2 * 1024 * 1024) + b'"}'
+    r = httpx.post(f"{hub.url}/api/thub/events", content=big, headers={"content-type": "application/json"}, timeout=30)
+    assert r.status_code == 413 and r.headers["x-error-code"] == "PayloadTooLarge"
+    # a request that only claims to be a gigabyte is refused on its headers, without waiting for a body
+    import socket
+    from urllib.parse import urlparse
+
+    u = urlparse(hub.url)
+    with socket.create_connection((u.hostname, u.port), timeout=10) as c:
+        c.sendall(b"POST /api/thub/publish HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: 1000000000\r\n\r\n")
+        c.settimeout(10)
+        head = c.recv(4096)
+    assert head.startswith(b"HTTP/1.1 413"), head[:60]
+
+
+def test_a_streamed_body_that_passes_the_limit_is_cut_off(hub):
+    def chunks():
+        for _ in range(40):
+            yield b"a" * 65536  # 2.5 MiB with no declared length
+
+    r = httpx.post(f"{hub.url}/api/thub/events", content=chunks(), headers={"content-type": "application/json"}, timeout=30)
+    assert r.status_code == 413
+
+
+def test_normal_sized_requests_still_work_and_other_paths_are_not_limited(hub):
+    assert post(hub, ident(2)).status_code in (200, 202)
+    assert httpx.get(f"{hub.url}/healthz", timeout=30).status_code == 200
+
+
+def test_deeply_nested_json_is_a_clean_400_not_a_crash(hub):
+    nested = b"[" * 100_000 + b"]" * 100_000
+    r = httpx.post(f"{hub.url}/api/thub/events", content=nested, headers={"content-type": "application/json"}, timeout=30)
+    assert r.status_code in (400, 413), r.status_code
+    assert httpx.get(f"{hub.url}/healthz", timeout=30).status_code == 200, "and the gateway is still up"
+    ev = {"id": "a", "pubkey": "b", "created_at": 1, "kind": 36780, "tags": [[["x"]] * 3] * 10, "content": "[" * 40_000, "sig": "c"}
+    assert post(hub, ev).status_code == 400

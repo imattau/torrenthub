@@ -203,19 +203,56 @@ def validate_torrent(data: bytes, key: str, size: int) -> dict:
     return meta
 
 
+def sanitize_torrent(data: bytes, trackers: list[str] | None = None, webseeds: list[str] | None = None) -> bytes:
+    """Keep what defines the content and nothing else the sender chose.
+
+    A torrent from another hub or a publisher can name any tracker, DHT node or web seed, and our
+    swarm engine would contact them: libtorrent refuses a tracker on a local address unless its
+    path ends in /announce, but `http://10.0.0.5/announce` still gets a request carrying this
+    machine's address and port, and a UDP tracker gets a packet. So only the `info` dictionary is
+    kept, copied byte for byte (so the infohash cannot change), and the trackers and web seeds are
+    the ones the caller, which is configured by the operator, passes in.
+
+    The `info` dictionary must already be in canonical form (sorted keys, no extra whitespace),
+    because infohash_from_torrent re-encodes it and the two must agree with libtorrent's, which
+    hashes the original bytes. Raises TorrentRejected otherwise.
+    """
+    if len(data) > MAX_TORRENT_BYTES:
+        raise TorrentRejected("torrent too large")
+    try:
+        if data[:1] != b"d":
+            raise ValueError("not a dictionary")
+        i = 1
+        info_raw = None
+        while data[i:i + 1] != b"e":
+            k, i = _decode(data, i)
+            start = i
+            v, i = _decode(data, i)
+            if k == b"info":
+                if not isinstance(v, dict):
+                    raise ValueError("info is not a dictionary")
+                info_raw, info = data[start:i], v
+        if i + 1 != len(data) or info_raw is None:
+            raise ValueError("no info dictionary, or trailing data")
+    except Exception as e:  # noqa: BLE001  (RecursionError, IndexError and ValueError all mean: not a torrent)
+        raise TorrentRejected(f"not a usable torrent: {type(e).__name__}") from e
+    if bencode(info) != info_raw:
+        raise TorrentRejected("the info dictionary is not in canonical form")
+    out = b"d"
+    if trackers:
+        out += b"8:announce" + bencode(trackers[0]) + b"13:announce-list" + bencode([[t] for t in trackers])
+    out += b"4:info" + info_raw
+    if webseeds:
+        out += b"8:url-list" + bencode(list(webseeds))
+    return out + b"e"
+
+
 def strip_webseeds(data: bytes) -> bytes:
     """Remove web seed URLs from a torrent. The infohash does not change, because web
     seeds live outside the info dict. Used so a client downloads from peers only."""
     meta = bdecode(data)
     meta.pop(b"url-list", None)
     meta.pop(b"httpseeds", None)
-    return bencode(meta)
-
-
-def with_webseeds(data: bytes, seeds: list[str]) -> bytes:
-    """Add web seed URLs to a torrent. The infohash does not change."""
-    meta = bdecode(data)
-    meta[b"url-list"] = [s.encode() for s in seeds]
     return bencode(meta)
 
 

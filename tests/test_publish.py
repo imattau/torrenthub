@@ -433,3 +433,48 @@ def test_the_manifest_age_limit_can_come_from_the_policy_file(hub, tmp_path):
         assert httpx.get(f"{ag2.url}/api/models/{REPO}/revision/main", timeout=30).json()["sha"] == c
     finally:
         ag2.stop()
+
+
+def test_a_publishers_torrent_cannot_make_the_hub_contact_anyone_and_the_stored_copy_is_clean(tmp_path):
+    import socket
+    import threading
+
+    from torrenthub.torrent import bdecode, bencode
+
+    hits = []
+    srv = socket.socket()
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(5)
+    port = srv.getsockname()[1]
+    stop = time.time() + 40
+
+    def serve():
+        srv.settimeout(0.5)
+        while time.time() < stop:
+            try:
+                c, _ = srv.accept()
+                hits.append(c.recv(2048).split(b"\r\n")[0])
+                c.close()
+            except OSError:
+                pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    h = Hub(tmp_path, publish_stall=15.0, trackers=["udp://tracker.operator.example:1337/announce"])
+    try:
+        root = write_tree(tmp_path / "s", FILES)
+        pub = prepare(SK, REPO, root, tmp_path / "st", seq=1)
+        big = hashlib.sha256(BIG).hexdigest()
+        meta = bdecode(base64.b64decode(pub.body["torrents"][big]))
+        meta.update({b"announce": f"http://127.0.0.1:{port}/announce".encode(), b"url-list": [f"http://127.0.0.1:{port}/web".encode()],
+                     b"nodes": [[b"127.0.0.1", port]]})
+        evil = bencode(meta)
+        pub.body["torrents"][big] = base64.b64encode(evil).decode()  # only what is sent to the hub is hostile; the publisher seeds the clean copy
+        assert run(_publish_only(h, pub))["state"] == "done"
+        stored = bdecode(h.store.torrent_path(big).read_bytes())
+        assert set(stored) == {b"info", b"announce", b"announce-list", b"url-list"}
+        assert stored[b"announce"] == b"udp://tracker.operator.example:1337/announce", "only the operator's tracker"
+        assert stored[b"url-list"] == [f"{h.settings.public_url}/blobs/{big}".encode()], "only the hub's own web seed"
+        assert hits == [], hits
+    finally:
+        h.stop()
+        srv.close()

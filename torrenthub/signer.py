@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import time
@@ -30,10 +31,13 @@ from pathlib import Path
 
 from . import events as E
 from . import verifier as V
-from .signing import public_key
+from .signing import backend, public_key
 
 MAX_LINE = 256 * 1024
 DEFAULT_CLAIMS = ("hash_verified", "format_scan", "replication")
+
+
+log = logging.getLogger("torrenthub.signer")
 
 
 @dataclass
@@ -54,6 +58,10 @@ class Signer:
         self.cfg = config
         self.clock = clock
         self.pubkey = public_key(secret).hex()
+        if backend() != "libsecp256k1":
+            log.warning("signing with the pure Python backend, whose running time depends on the secret key. "
+                        "A client that can time this signer's answers could learn about the key. "
+                        "Install the fast backend: pip install 'torrenthub[fast]'")
         self.cfg.audit_path.parent.mkdir(parents=True, exist_ok=True)
         self.signed: deque[float] = deque()
         self._reload_counts()
@@ -87,7 +95,7 @@ class Signer:
     def handle(self, req: dict) -> dict:
         op = req.get("op") if isinstance(req, dict) else None
         if op == "pubkey":
-            return {"ok": True, "pubkey": self.pubkey}
+            return {"ok": True, "pubkey": self.pubkey, "crypto": backend()}
         try:
             events = self._decide(op, req)
         except Refused as r:

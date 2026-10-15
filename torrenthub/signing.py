@@ -3,9 +3,15 @@
 This is the same signature scheme and event layout Nostr uses (NIP-01), so a signed manifest can
 also be published to a relay. Nothing here talks to a relay.
 
-The code is small and slow (pure Python, a few milliseconds per signature). It is checked against
-the official BIP-340 test vectors in tests/data. Do not use it for anything that needs constant
-time behaviour: signing here is for a creator signing a manifest on their own machine.
+Two backends, same results. If the `coincurve` package is installed (pip install
+'torrenthub[fast]') signing, verifying and key derivation use libsecp256k1, which runs in constant
+time and is about a hundred times faster. Otherwise a pure Python version runs. It is checked
+against the official BIP-340 test vectors in tests/data and against the other backend, but its
+running time depends on the secret: scalar multiplication measured 5.1 ms for a secret with two bits
+set and 10.1 ms for one with 255 set. Anything that signs on request for other parties, such as the
+signer process, should have the fast backend (`backend()` says which is in use). The libsecp256k1
+path takes 32 byte messages only, which is every event id; other lengths use the Python code.
+Set THUB_PURE_PYTHON_CRYPTO=1 to force the Python backend.
 """
 
 from __future__ import annotations
@@ -22,6 +28,18 @@ G = (
 )
 
 Point = tuple[int, int] | None
+
+try:
+    if os.environ.get("THUB_PURE_PYTHON_CRYPTO"):
+        raise ImportError("pure Python forced")
+    import coincurve as _cc
+except ImportError:
+    _cc = None
+
+
+def backend() -> str:
+    """"libsecp256k1" (constant time) or "python" (not)."""
+    return "libsecp256k1" if _cc is not None else "python"
 
 
 def _add(a: Point, b: Point) -> Point:
@@ -66,6 +84,15 @@ def _lift_x(x: int) -> Point:
 
 def public_key(secret: bytes) -> bytes:
     d = int.from_bytes(secret, "big")
+    if len(secret) != 32 or not 1 <= d < N:
+        raise ValueError("secret key out of range")
+    if _cc is not None:
+        return _cc.PrivateKey(secret).public_key.format(compressed=True)[1:]
+    return public_key_py(secret)
+
+
+def public_key_py(secret: bytes) -> bytes:
+    d = int.from_bytes(secret, "big")
     if not 1 <= d < N:
         raise ValueError("secret key out of range")
     pt = _mul(G, d)
@@ -75,9 +102,21 @@ def public_key(secret: bytes) -> bytes:
 
 def sign(msg: bytes, secret: bytes, aux: bytes | None = None) -> bytes:
     d0 = int.from_bytes(secret, "big")
-    if not 1 <= d0 < N:
+    if len(secret) != 32 or not 1 <= d0 < N:
         raise ValueError("secret key out of range")
     aux = os.urandom(32) if aux is None else aux
+    if _cc is not None and len(msg) == 32 and len(aux) == 32:
+        sig = _cc.PrivateKey(secret).sign_schnorr(msg, aux)
+        if not verify(msg, public_key(secret), sig):  # the same cheap self check as below
+            raise RuntimeError("produced an invalid signature")
+        return sig
+    return sign_py(msg, secret, aux)
+
+
+def sign_py(msg: bytes, secret: bytes, aux: bytes) -> bytes:
+    d0 = int.from_bytes(secret, "big")
+    if not 1 <= d0 < N:
+        raise ValueError("secret key out of range")
     pt = _mul(G, d0)
     assert pt is not None
     d = d0 if pt[1] % 2 == 0 else N - d0
@@ -92,12 +131,23 @@ def sign(msg: bytes, secret: bytes, aux: bytes | None = None) -> bytes:
     rx = r_pt[0].to_bytes(32, "big")
     e = int.from_bytes(_tagged("BIP0340/challenge", rx, px, msg), "big") % N
     sig = rx + ((k + e * d) % N).to_bytes(32, "big")
-    if not verify(msg, px, sig):  # cheap self check
+    if not verify_py(msg, px, sig):  # cheap self check
         raise RuntimeError("produced an invalid signature")
     return sig
 
 
 def verify(msg: bytes, pub: bytes, sig: bytes) -> bool:
+    if len(pub) != 32 or len(sig) != 64:
+        return False
+    if _cc is not None and len(msg) == 32:
+        try:
+            return bool(_cc.PublicKeyXOnly(pub).verify(sig, msg))
+        except (ValueError, TypeError):
+            return False
+    return verify_py(msg, pub, sig)
+
+
+def verify_py(msg: bytes, pub: bytes, sig: bytes) -> bool:
     if len(pub) != 32 or len(sig) != 64:
         return False
     pt = _lift_x(int.from_bytes(pub, "big"))
