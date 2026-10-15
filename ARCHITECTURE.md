@@ -286,7 +286,7 @@ The direction since then is **participants**: humans and AI agents on equal term
 | Phase | Work | Gate to move on |
 |---|---|---|
 | V | Run `validation/` on real Hugging Face (including Xet backed repos) and on two real machines. Measure the peer share. | Probe passes, live test matches, peers find each other, the peer share is worth having. If not, the design changes first. |
-| P0 | Review `PROTOCOL.md`, assign event kinds after rechecking the registry, decide the policy file format | Approval, and the open questions in `PROTOCOL.md` section 11 answered |
+| P0 (review done 2026-10-16: kinds checked and assigned, policy format is TOML) | Review `PROTOCOL.md`, assign event kinds after rechecking the registry, decide the policy file format | Approval, and the open questions in `PROTOCOL.md` section 11 answered |
 | P1 (first slice built: events, trust evaluator, store, admission, API, CLI, delegation in `signed:` rules; policy file not built, see `PROTOCOL.md` section 12) | Event store and API, identity, delegation, endorsement and revocation events, the trust evaluator, policy engine, admission control | The sybil, collusion, revocation, taint and order independence simulations pass |
 | P2 (built: see `PROTOCOL.md` section 13; `eval` and class R not built) | Attestations (`hash_verified`, `format_scan`), a verifier agent, replication events, a signer process with limits, and the MCP write tools (the read and download MCP server, `torrenthub mcp`, already exists; `PROTOCOL.md` section 8a) | A verifier agent publishes and a consumer's behaviour changes because of it. A bad attestor is caught. |
 | P3 | Reproducible derivations (first measure bit exactness of one tool across machines) | Measured on two machines, or the tool stays self-reported |

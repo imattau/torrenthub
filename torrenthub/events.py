@@ -1,9 +1,10 @@
 """The participant events: identity, delegation, endorsement and revocation.
 
 All use the NIP-01 layout from signing.py, with ASCII JSON content and a version field.
-Kind numbers 36778 to 36781 are provisional. A look at the NIPs README on the day this was
-written showed nothing in 36770 to 36799, but the full registry (registry-of-kinds) was not
-checked. Change them in one place here if that matters.
+Kind numbers 36778 to 36782 were checked against the NIPs README table and the NIPs repo's pull
+requests, issues and code on 2026-10-16: no collisions. Nobody has registered them, so they are
+not reserved. Change them in one place here if a NIP ever claims them. PROTOCOL.md section 3
+lists the assigned and reserved numbers.
 
 parse_event() is the one place that decides whether an event is well formed. It does not decide
 whether anyone should believe it. That is trust.py.

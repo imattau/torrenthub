@@ -1,6 +1,6 @@
-# Participants: a protocol sketch (v0.3, part built)
+# Participants: a protocol sketch (v0.4, part built, P0 review done)
 
-Status: P1 and P2 are built and tested (sections 12 and 13 say exactly what, and what is not): identity, delegation, endorsement, revocation and attestation events, the trust evaluator, the event store, admission control, the HTTP API, the CLI, the policy file, a verifier, replication, a signer and the MCP write tool. Derivations, requests, the publishing path and everything after P2 are still design only. Event kind numbers are provisional. Nothing has been run against a real network or real participants, and the validation work in `validation/README.md` still comes first.
+Status: P1 and P2 are built and tested (sections 12 and 13 say exactly what, and what is not): identity, delegation, endorsement, revocation and attestation events, the trust evaluator, the event store, admission control, the HTTP API, the CLI, the policy file, a verifier, replication, a signer and the MCP write tool. Derivations, requests, the publishing path and everything after P2 are still design only. Event kind numbers were checked against the NIPs registry on 2026-10-16 and are assigned in section 3. Nothing has been run against a real network or real participants, and the validation work in `validation/README.md` still comes first.
 
 ## 1. The idea
 
@@ -26,7 +26,7 @@ Each issue was raised in discussion. "Not solved" says what stays open.
 | 3 | "Trained on X" and other provenance cannot be verified | Claims are classed D (recompute), R (re-run, within tolerance) or S (self-reported). The class comes from the event type. Policies can demand a class (section 4). | S claims stay unverifiable. Provenance of training data stays a claim. |
 | 4 | Someone is accountable for what an agent publishes | Signed delegation chains from an identifiable root, with scope, limits and expiry. Consumers can require a chain that ends at a key they know. | Legal responsibility is a question for whoever runs the hub and the agent. A protocol cannot settle it. |
 | 5 | A bad model becomes the base of many others quickly | Revocation events with taint. Descendants are found through derivation links, and the consumer's policy decides what to do with them (section 4.6). | A backdoor nobody has found is not covered. Absence of a backdoor cannot be proven. |
-| 6 | Attestors may be wrong or become dishonest | Replication events: anyone re-runs an attestation and signs match or mismatch. Mismatches lower the attestor's standing through revocation of the endorsement. Consumers can sample. | Costs compute. Cheap to check is not the same as free. |
+| 6 | Attestors may be wrong or become dishonest | Replication events: anyone re-runs an attestation and signs match or mismatch. A mismatch from a replicator the consumer trusts makes that consumer drop the attestor locally (section 13). Only the endorser can revoke an endorsement. Consumers can sample. | Costs compute. Cheap to check is not the same as free. |
 | 7 | Models training on each other's output | Derivations and datasets declare data origin (`human`, `synthetic`, `mixed`, `unknown`) and carry a synthetic generation depth. Policies can cap depth. | Undeclared synthetic data cannot be seen. The depth is a lower bound. |
 | 8 | Floods, and hub load | Admission control at the hub: size limits, per key rate limits, a small quota for strangers, a larger one for keys in the hub's own graph (section 7). Clients ignore anything outside their graph. | A determined flood still costs the hub something. It costs availability, not correctness. |
 | 9 | Unsafe weight formats | Mechanical checks, class D: a `format_scan` attestation, and a hub or consumer policy that refuses pickle based formats unless a trusted scan exists (section 4). | Scans catch known bad patterns, not all malicious content. |
@@ -38,7 +38,22 @@ Each issue was raised in discussion. "Not solved" says what stays open.
 
 ## 3. Event types
 
-Common to all events: the NIP-01 layout already in `signing.py` (id, pubkey, created_at, kind, tags, content, sig). Kind numbers are assigned at implementation time, in the addressable range, after checking the NIPs registry again. 36777 is the manifest today and is provisional.
+Common to all events: the NIP-01 layout already in `signing.py` (id, pubkey, created_at, kind, tags, content, sig). Kinds are in the addressable range (30000 to 39999). On 2026-10-16 the NIPs README kinds table, and the repo's open and closed pull requests, issues and code, had no entry or mention of the numbers below (the table has no kinds in 36000 to 36999; its nearest rows are 37516 and 37517). Using a number does not reserve it: nobody has registered these, and anyone can publish a conflicting NIP. If this protocol is adopted outside this project, propose a NIP and move the numbers if asked. They are defined in one place each (`manifest.py`, `events.py`).
+
+| Kind | Event | Status |
+|---|---|---|
+| 36777 | `manifest` | built |
+| 36778 | `identity` | built |
+| 36779 | `delegation` | built |
+| 36780 | `endorsement` | built |
+| 36781 | `revocation` | built |
+| 36782 | `attestation` | built |
+| 36783 | `derivation` | reserved, P3 |
+| 36784 | `request` | reserved, P5 |
+| 36785 | `claim` | reserved, P5 |
+| 36786 | `result` | reserved, P5 |
+
+A change to an event's fields that old readers cannot parse bumps its content `v` field. It does not get a new kind.
 
 References to content use the tag names NIP-94 (file metadata) already uses, so existing tools can read them: `x` is a sha256 of a file, `i` is a torrent infohash, `magnet` is an optional magnet URI. References to other events use `e`. `content` is ASCII JSON with a version field, as the manifest already is.
 
@@ -49,7 +64,7 @@ Key, optional recovery key, label, optional contact or operator note. `supersede
 A repo's file table at a commit, signed by the namespace owner. v2 adds `seq` (strictly increasing per repo and ref), `valid_until` (optional), and `files_x`/`files_i` to move a large table into a blob.
 
 ### 3.3 `delegation`
-Issuer authorises a key to act for it. Fields: `subject` key, `scope` (a list such as `publish:acme/*`, `attest:*`), limits (`max_bytes_per_day`, `max_events_per_day`), `not_before`, `expires`, `revocable` (always true in v1). A manifest signed by a delegate is valid for a rule `acme/*=signed:ROOT` when a chain of unexpired, unrevoked delegations covers `publish:<repo>` from ROOT to the signer. Delegation transfers authority. Anyone can verify it from the root alone. It is not an opinion.
+Issuer authorises a key to act for it. Fields: `subject` key, `scope` (a list such as `publish:acme/*`, `attest:*`), limits (`max_bytes_per_day`, `max_events_per_day`), `not_before`, `expires`, `revocable` (always true in v1), `redelegable` (may the delegate pass the authority on; default false). A manifest signed by a delegate is valid for a rule `acme/*=signed:ROOT` when a chain of unexpired, unrevoked delegations covers `publish:<repo>` from ROOT to the signer. Delegation transfers authority. Anyone can verify it from the root alone. It is not an opinion.
 
 ### 3.4 `endorsement`
 "I trust key K for these scopes." Fields: `subject` key, `scope` list, `weight` in (0, 1], `delegable` (may K's own endorsements count onward), `expires`. An endorsement is an opinion and is weighed, never obeyed. Different from delegation: delegation says K acts as me, endorsement says I think K is reliable.
@@ -79,7 +94,7 @@ Request: task type, inputs by hash, a spec hash, deadline, optional reward point
 
 ## 4. Policy
 
-A consumer's policy is a file. Rules say what must hold before a thing is used. The format is not decided. The rule types are:
+A consumer's policy is a file. Rules say what must hold before a thing is used. The format is TOML, one file per gateway (`THUB_POLICY`, section 11 item 1), and the `[[file]]` rules for `require` (a claim, `independent`, `min_trust`), `deny` and `allow` are built (section 13). The other rule types below are design only. The rule types are:
 
 - `root`: keys pinned with weight 1.
 - `require signed(root[, ...])` for a namespace, as `THUB_TRUST` does now, including delegation chains.
@@ -167,7 +182,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | Phase | Work | Gate to move on |
 |---|---|---|
 | V | Run the validation kit on real Hugging Face and real machines | Probe passes (including Xet backed repos), live test matches, peers find each other, peer share is worth having |
-| P0 | Review this document. Assign kind numbers after rechecking the registry. Policy format decided (section 11). | You approve, open questions in section 11 answered |
+| P0 (review done 2026-10-16; waiting for your approval) | Review this document. Assign kind numbers after rechecking the registry. Policy format decided (section 11). | You approve, open questions in section 11 answered |
 | P1 (partly built, section 12) | Generalise to an event store and API. Identity, delegation, endorsement and revocation events. The trust evaluator and policy engine. CLI. Admission control. | The simulation tests in section 9 pass, including order independence and the sybil and collusion cases, with timings for a large event set |
 | P2 (built, section 13) | Attestations: `hash_verified` and `format_scan`, a verifier agent, replication events, `independent(n)`, a signer process, and the MCP write tools (read and download tools already exist, M0) | A verifier agent publishes, a consumer policy changes behaviour because of it, and a bad attestor is caught by replication |
 | P3 | Derivations. First test determinism of one tool across machines. Only then put it on a trusted list. | Bit exactness measured on at least two different machines, or the tool stays class S |

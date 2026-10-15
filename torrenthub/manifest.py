@@ -7,9 +7,9 @@ with these sizes and hashes, and these branch names pointed at it at created_at.
 An agent that pins the creator's public key for a repo namespace can then take hashes from
 any hub and know they are the creator's, without trusting the hub or any origin.
 
-Kind 36777 is provisional. It is in the addressable range (30000 to 39999) and was not listed
-in the NIPs README when this was written, but nobody has registered it for this. Change
-MANIFEST_KIND if that matters to you.
+Kind 36777 is in the addressable range (30000 to 39999). It was checked against the NIPs README
+table and the NIPs repo on 2026-10-16: no collisions, but nobody has registered it for this.
+Change MANIFEST_KIND if a NIP ever claims it.
 """
 
 from __future__ import annotations
