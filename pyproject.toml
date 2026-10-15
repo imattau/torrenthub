@@ -3,14 +3,14 @@ name = "torrenthub"
 version = "0.1.0"
 description = "Hugging Face compatible model mirror that distributes weights over BitTorrent"
 requires-python = ">=3.11"
-dependencies = ["fastapi", "uvicorn", "httpx"]
+dependencies = ["fastapi>=0.143,<1", "uvicorn>=0.54,<1", "httpx>=0.28,<1"]
 
 [project.optional-dependencies]
-swarm = ["libtorrent"]
-mcp = ["mcp>=2"]
-relay = ["websockets"]
-fast = ["coincurve"]
-dev = ["pytest", "huggingface_hub", "mcp>=2", "websockets", "coincurve"]
+swarm = ["libtorrent>=2.0,<3"]
+mcp = ["mcp>=2,<3"]
+relay = ["websockets>=15,<18"]
+fast = ["coincurve>=21,<22"]
+dev = ["pytest>=9,<10", "huggingface_hub>=2,<3", "mcp>=2,<3", "websockets>=15,<18", "coincurve>=21,<22", "numpy>=2,<3"]
 
 [project.scripts]
 torrenthub = "torrenthub.cli:main"

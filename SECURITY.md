@@ -23,11 +23,12 @@ what is known to be weak. Treat the project as a prototype.
 - The signer protects against an agent, not against other code running as the same user, which can read the key file.
 - Admission verifies a signature per event; with the Python backend that is about 20 ms. The per-address limit bounds a single address, not a distributed flood.
 - A hub or relay can withhold a revocation or a newer manifest. Expiry, maximum age and asking several sources reduce this; they cannot remove it.
-- Dependencies were not audited.
 
 ## Dependencies
 
-`pip-audit` (2026-10-16, against the project's environment) found no known vulnerabilities in any runtime dependency. Its only findings were against `pip` 24.0 in the development environment, which is installer tooling, and which was upgraded. `pyproject.toml` pins no versions, so a fresh install takes the newest; pin and re-audit before deploying.
+`pip-audit` (2026-10-16) found no known vulnerabilities in `lock/runtime.txt` (36 packages, everything a deployment installs) or `lock/dev.txt`. The earlier run's only findings were against `pip` 24.0 in a development environment, since upgraded.
+
+Versions are now bounded in `pyproject.toml` (a tested floor and the next major as ceiling) and fixed exactly in `lock/`; install with `pip install -c lock/runtime.txt ...`. The full suite passes on the locked set in a clean virtualenv. Limits: the locks hold versions, not hashes, so a tampered package index is not defended against; they were built for CPython 3.12 on Linux x86_64; and a lock goes stale: re-run the audit on a schedule (`lock/README.md` has the steps). `libtorrent` is a native library with its own history of memory-safety fixes and is the dependency most worth watching.
 
 ## Not reviewed
 
