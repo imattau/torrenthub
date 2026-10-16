@@ -155,6 +155,8 @@ Gateway endpoints beyond the HF API: `/metrics` (Prometheus text), `/healthz`, `
 | `THUB_EVENTS_PER_IP_BURST` / `_MINUTE`, `THUB_PUBLISH_PER_IP_MINUTE` | `300` / `600`, `30` | Requests an address may send to the event and publish endpoints; 0 turns a limit off. Behind a proxy on another machine, set uvicorn's `FORWARDED_ALLOW_IPS` to its address |
 | `THUB_MAX_EVENT_BODY`, `THUB_PUBLISH_MAX_BODY` | `256K`, `64M` | Largest request body read for each POST endpoint |
 | `THUB_PUBLISH_QUOTA` | `0` | Bytes of published content one signing key may hold here, such as `10G`. 0 turns publishing off. Only roots and their `publish:<repo>` delegates may publish |
+| `THUB_PUBLISH_GIT`, `THUB_PUBLISH_ALLOW_FORCE` | `1`, `0` | Take git backed publications (needs `git` on the hub); accept a manifest that rewrites a branch |
+| `THUB_PUBLISH_GIT_MAX_PACK`, `_BLOB_MAX`, `_SMALL_TOTAL`, `_MAX_OBJECTS`, `_TIMEOUT` | `32M`, `8M`, `64M`, `100000`, `60` | Limits on a publisher's git objects: the pack, one plain file (bigger must be a pointer), all plain files of a commit, objects in the history, seconds per git command |
 | `THUB_PUBLISH_STALL` / `THUB_PUBLISH_TIMEOUT` | `120` / `3600` | Seconds a publisher may send nothing, and the longest a publication may take |
 | `THUB_MANIFEST_MAX_AGE` | none | Seconds. Refuse to resolve a branch name through a signed manifest older than this |
 | `THUB_OUTGOING_UTP` | `false` | Dial peers over uTP first, which is libtorrent's own default. Off means TCP. Between two machines on a fast link uTP-first was about 15x slower |
@@ -227,6 +229,14 @@ torrenthub publish --repo you/model --dir ./model --hub https://hub.example --ke
 ```
 
 It hashes the directory, signs a manifest, sends it with the torrents of the big files, then seeds them and dials the hub, which pulls the bytes and checks them against the signed hashes before anything is visible. Agents fetch it with `THUB_TRUST="you/*=signed:<your public key>"`. Use `--valid-days N` to make a manifest expire.
+
+**From a git repository.** Keep the repo in git, with big files as LFS pointers (git-lfs's format) and the real bytes in the working tree or git-lfs's cache, and publish a commit:
+
+```bash
+torrenthub publish --repo you/model --git ./model --hub https://hub.example --key-file ~/.thub/key
+```
+
+The commit id is git's own, history is kept (the hub holds a bare git repository per repo), and a new commit must descend from the branch's current one unless you pass `--force` and the hub allows it (`THUB_PUBLISH_ALLOW_FORCE=1`). Only objects the hub lacks are sent, and big files it already holds are not hashed again. The hub needs `git` installed. Details and limits: `HOSTING.md` and `PROTOCOL.md` section 18. `torrenthub publish --git` reads the committed state, not the working tree, apart from finding the big files' bytes.
 
 ## Asking for work
 

@@ -24,6 +24,10 @@ what is known to be weak. Treat the project as a prototype.
 - Admission verifies a signature per event; with the Python backend that is about 20 ms. The per-address limit bounds a single address, not a distributed flood.
 - A hub or relay can withhold a revocation or a newer manifest. Expiry, maximum age and asking several sources reduce this; they cannot remove it.
 
+## Git backed publishing (added with H1)
+
+New surface: a hub runs `git` on objects a publisher chose. The measures are in `PROTOCOL.md` section 18; the ones that matter here: every command runs in a fresh repository the hub controls, with no system or user config, no hooks and no templates, with a time limit and a file size limit; the pack is size capped; `index-pack --strict` checks the objects; the tree is refused if it holds a symlink, submodule, `.git` component, case collision or a large non-pointer file; nothing is kept until the whole publication has succeeded. What is not covered: a pack built to inflate (small on the wire, large when read) costs CPU until the time limit stops it (measured: 4.2 MB holding 4 GiB took 8.8 s to index; the limit cut it off when set lower), and only a signer the hub authorised reaches git at all; git itself (a parser of hostile input written in C) is a dependency this review did not read; and a hub that sets `THUB_PUBLISH_ALLOW_FORCE=1` lets a signer rewrite a branch it was allowed to publish.
+
 ## Dependencies
 
 `pip-audit` (2026-10-16) found no known vulnerabilities in `lock/runtime.txt` (36 packages, everything a deployment installs) or `lock/dev.txt`. The earlier run's only findings were against `pip` 24.0 in a development environment, since upgraded.

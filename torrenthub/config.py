@@ -137,6 +137,14 @@ class Settings:
     publish_inline_max: int = 4 * 1024 * 1024  # small files sent in the request itself, in all
     publish_max_files: int = 5000
     publish_max_jobs_per_key: int = 2
+    # Git backed publications (HOSTING.md). Off when git is not installed on the hub.
+    publish_git: bool = True
+    publish_git_max_pack: int = 32 * 1024 * 1024  # largest pack accepted
+    publish_git_blob_max: int = 8 * 1024 * 1024  # a git file bigger than this must be an LFS pointer
+    publish_git_small_total: int = 64 * 1024 * 1024  # all plain (non pointer) files of one commit together
+    publish_git_max_objects: int = 100_000  # objects in the whole history
+    publish_git_timeout: float = 60.0  # per git command
+    publish_allow_force: bool = False  # accept a manifest that moves a branch to a commit that does not descend from it
     # Largest request body, in bytes, read for each POST endpoint. An event is capped at 64 KiB by its parser.
     max_event_body: int = 256 * 1024
     # Requests per client address for the POST endpoints: a burst, then this many a minute. 0 turns it off.
@@ -209,6 +217,13 @@ class Settings:
             publish_per_ip_per_minute=float(e("THUB_PUBLISH_PER_IP_MINUTE", "30")),
 
             publish_max_body=parse_size(e("THUB_PUBLISH_MAX_BODY"), 64 * 1024 * 1024),
+            publish_git=_bool(e("THUB_PUBLISH_GIT"), True),
+            publish_git_max_pack=parse_size(e("THUB_PUBLISH_GIT_MAX_PACK"), 32 * 1024 * 1024),
+            publish_git_blob_max=parse_size(e("THUB_PUBLISH_GIT_BLOB_MAX"), 8 * 1024 * 1024),
+            publish_git_small_total=parse_size(e("THUB_PUBLISH_GIT_SMALL_TOTAL"), 64 * 1024 * 1024),
+            publish_git_max_objects=int(e("THUB_PUBLISH_GIT_MAX_OBJECTS", "100000")),
+            publish_git_timeout=float(e("THUB_PUBLISH_GIT_TIMEOUT", "60")),
+            publish_allow_force=_bool(e("THUB_PUBLISH_ALLOW_FORCE"), False),
             publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),
             roots=parse_keys(e("THUB_ROOTS")),
             trust_hops=int(e("THUB_TRUST_HOPS", "3")),

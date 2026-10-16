@@ -13,6 +13,12 @@ file table, each torrent against the piece policy and the signed size and hash, 
 quota. After the transfer: the sha256 of every file. A failed publication leaves nothing behind
 that a reader can see: refs and commits are written in one step, last.
 
+A version 3 manifest (HOSTING.md) names a git commit. The publisher sends a pack of the missing
+objects; the hub indexes it in a throwaway repository, checks it is complete, derives the file
+table from the commit and refuses a manifest whose table differs, requires the new commit to
+descend from the branch's current one, and keeps the objects in a bare repository of its own only
+once the whole publication has succeeded.
+
 What this does not do: decide whether the content is any good (attestations and policy do that),
 or stop a publisher from filling its own quota with junk.
 """
@@ -25,13 +31,16 @@ import binascii
 import hashlib
 import logging
 import re
+import shutil
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import gitrepo
 from .config import Settings
-from .manifest import Manifest, ManifestInvalid, content_commit, verify_manifest
+from .manifest import Manifest, ManifestInvalid, content_commit, table_sha256, verify_manifest
 from .metrics import Metrics
 from .store import BlobRow, FileRec, Store
 from .swarm import Swarm
@@ -48,6 +57,14 @@ class PublishError(Exception):
     def __init__(self, status: int, code: str, message: str):
         super().__init__(message)
         self.status, self.code, self.message = status, code, message
+
+
+@dataclass
+class GitWork:
+    tmp: Path  # throwaway repository holding the publisher's pack
+    pack_sha: str
+    pack_size: int
+    derived: gitrepo.Derived
 
 
 @dataclass
@@ -80,12 +97,7 @@ REPO_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._
 SHA256_HEX = re.compile(r"[0-9a-f]{64}")
 
 
-def safe_path(p) -> bool:
-    """A file path inside a repo: forward slashes, no empty, "." or ".." parts, no backslash and no
-    control characters. Any other character, in any script, is fine."""
-    return (isinstance(p, str) and 0 < len(p) <= MAX_PATH_LEN and not p.startswith("/")
-            and "\\" not in p and all(part not in ("", ".", "..") for part in p.split("/"))
-            and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in p))
+safe_path = gitrepo.safe_path
 
 
 def info_from_rows(repo: str, commit: str, rows) -> dict:
@@ -101,6 +113,7 @@ class Ingest:
         self.jobs: dict[str, Job] = {}
         self._tasks: set[asyncio.Task] = set()
         self._locks: dict[str, asyncio.Lock] = {}
+        self._git_slots = asyncio.Semaphore(2)  # git commands on publishers' objects run two at a time
 
     # ------------------------------------------------------------------ checks
     def _authorised(self, graph: Graph, signer: str, repo: str) -> None:
@@ -130,6 +143,7 @@ class Ingest:
         return m, table
 
     def _check_rows(self, m: Manifest) -> None:
+        git = m.git is not None
         rows = m.rows
         if not rows or len(rows) > self.s.publish_max_files:
             raise PublishError(400, "BadManifest", f"a publication holds 1 to {self.s.publish_max_files} files")
@@ -142,7 +156,7 @@ class Ingest:
                 raise PublishError(400, "BadManifest", f"unsafe path {path!r}")
             if not isinstance(size, int) or isinstance(size, bool) or size < 0 or not isinstance(x, str) or not SHA256_HEX.fullmatch(x) or blob_id is not None:
                 raise PublishError(400, "BadManifest", f"{path}: a published file needs a size and a sha256 and no git blob id")
-        if m.commit != content_commit(rows):
+        if not git and m.commit != content_commit(rows):
             raise PublishError(400, "BadManifest", "the commit is not the name of this file table")
 
     def _check_seq(self, m: Manifest) -> bool:
@@ -166,13 +180,116 @@ class Ingest:
         m, table = self._check_manifest(body, now)
         self._authorised(self.graph_fn(), m.pubkey, m.repo)
         self._check_rows(m)
-        async with self._lock(m.repo):
-            return await self._start(m, table, body, now)
+        self._check_kind(m)
+        if self._check_seq(m):
+            return {"state": "done", "already": True, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.listen_port}}
+        self._check_jobs(m)
+        work = await self._check_git(m, body) if m.git is not None else None
+        try:
+            async with self._lock(m.repo):
+                out = await self._start(m, table, body, now, work)
+        except BaseException:
+            if work:
+                shutil.rmtree(work.tmp, ignore_errors=True)
+            raise
+        if work and "job" not in out:
+            shutil.rmtree(work.tmp, ignore_errors=True)
+        return out
+
+    def _check_jobs(self, m: Manifest) -> None:
+        if sum(1 for j in self.jobs.values() if j.signer == m.pubkey and j.state == "pulling") >= self.s.publish_max_jobs_per_key:
+            raise PublishError(429, "TooManyPublications", "this key already has publications in progress")
+
+    def _check_kind(self, m: Manifest) -> None:
+        """A repo is either git backed or it is not, from its first publication. Mixing would leave
+        a branch whose old head is not a git commit, so no fast-forward check could mean anything."""
+        git = m.git is not None
+        for ev in self.store.list_manifests(m.repo):
+            if (Manifest_version(ev) == 3) != git:
+                raise PublishError(409, "WrongKind", f"{m.repo} was published {'without' if git else 'with'} git; publish this under another name")
+
+    # ------------------------------------------------------------------ git
+    def _perm_repo(self, repo: str) -> Path:
+        return self.store.root / "git" / (repo.replace("/", "__") + ".git")
+
+    async def _check_git(self, m: Manifest, body: dict) -> GitWork:
+        s = self.s
+        if not s.publish_git or not gitrepo.have_git():
+            raise PublishError(501, "NoGit", "this hub does not take git backed publications")
+        g = body.get("git")
+        if not isinstance(g, dict) or g.get("head") != m.commit:
+            raise PublishError(400, "BadRequest", "git.head must be the manifest's commit")
+        if not all(gitrepo.valid_ref(r) for r in m.refs):
+            raise PublishError(400, "BadManifest", "a branch name is not usable")
+        pack = _b64(g.get("pack"), "git.pack")
+        async with self._git_slots:
+            return await asyncio.to_thread(self._git_check, m, pack)
+
+    def _git_check(self, m: Manifest, pack: bytes) -> GitWork:
+        s = self.s
+        (self.store.root / "tmp").mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix="git-", dir=self.store.root / "tmp"))
+        try:
+            perm = self._perm_repo(m.repo)
+            gitrepo.init_bare(tmp, perm if perm.exists() else None)
+            pack_sha = gitrepo.index_pack(tmp, pack, max_pack=s.publish_git_max_pack, timeout=s.publish_git_timeout)
+            if gitrepo.object_type(tmp, m.commit) != "commit":
+                raise gitrepo.GitError("the commit named in the manifest is not in the pack or the hub's copy")
+            gitrepo.check_connected(tmp, m.commit, max_objects=s.publish_git_max_objects, timeout=s.publish_git_timeout)
+            d = gitrepo.derive(tmp, m.commit, blob_max=s.publish_git_blob_max, small_total=s.publish_git_small_total, max_files=s.publish_max_files)
+            if d.tree != m.git["tree"] or list(d.parents) != m.git["parents"]:
+                raise gitrepo.GitError("the manifest's tree and parents are not those of the commit")
+            if d.rows != tuple(m.rows):
+                raise gitrepo.GitError("the file table in the manifest is not the one this commit gives")
+            self._check_ff(tmp, m)
+            return GitWork(tmp, pack_sha, len(pack), d)
+        except gitrepo.GitError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise PublishError(400, "BadGit", str(e)) from None
+        except BaseException:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise
+
+    def _check_ff(self, tmp: Path, m: Manifest) -> None:
+        """Each branch the manifest names may only move forward in history, unless the publisher
+        asked to rewrite it and this hub allows that."""
+        for ref in m.refs:
+            cur = self.store.get_ref(m.repo, ref)
+            if cur is None or cur[0] == m.commit:
+                continue
+            if gitrepo.is_ancestor(tmp, cur[0], m.commit):
+                continue
+            if m.git["force"] and self.s.publish_allow_force:
+                continue
+            why = "the manifest asks for a rewrite and this hub does not allow it" if m.git["force"] else "it is not a fast-forward"
+            raise PublishError(409, "NotFastForward", f"{ref} is at {cur[0][:12]} and {m.commit[:12]} does not descend from it ({why})")
+
+    def _git_finish(self, m: Manifest, work: GitWork) -> None:
+        """Last step before the repo shows: check the branches again (another publication may have
+        moved one while this one transferred), then keep the objects and move the branches."""
+        self._check_ff(work.tmp, m)
+        perm = self._perm_repo(m.repo)
+        gitrepo.adopt(work.tmp, perm, work.pack_sha)
+        for ref in m.refs:
+            gitrepo.update_ref(perm, ref, m.commit)
+
+    def git_refs(self, repo: str) -> dict:
+        """Branch -> commit for a git backed repo, from the newest manifest naming each branch."""
+        best: dict[str, tuple[int, str]] = {}
+        for ev in self.store.list_manifests(repo):
+            if Manifest_version(ev) != 3:
+                continue
+            _, seq, refs = Manifest_seq(ev)
+            commit = next((t[1] for t in ev["tags"] if t[0] == "commit"), None)
+            for r in refs:
+                if commit and seq > best.get(r, (0, ""))[0]:
+                    best[r] = (seq, commit)
+        return {r: c for r, (_, c) in sorted(best.items())}
 
     def _lock(self, repo: str) -> asyncio.Lock:
         return self._locks.setdefault(repo, asyncio.Lock())
 
-    async def _start(self, m: Manifest, table: bytes | None, body: dict, now: float) -> dict:
+    async def _start(self, m: Manifest, table: bytes | None, body: dict, now: float, work: GitWork | None = None) -> dict:
         if self._check_seq(m):
             return {"state": "done", "already": True, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.listen_port}}
         if sum(1 for j in self.jobs.values() if j.signer == m.pubkey and j.state == "pulling") >= self.s.publish_max_jobs_per_key:
@@ -182,7 +299,11 @@ class Ingest:
         if not isinstance(inline_raw, dict) or not isinstance(torrents_raw, dict):
             raise PublishError(400, "BadRequest", "inline and torrents must be objects")
         inline = {x: _b64(v, f"inline {x[:12]}") for x, v in inline_raw.items()}
-        if sum(len(v) for v in inline.values()) > self.s.publish_inline_max:
+        if work is not None:
+            inline.update(work.derived.small)  # plain git files came in the pack, already hashed
+            if set(work.derived.big) & set(work.derived.small):
+                raise PublishError(400, "BadGit", "a plain file has the same sha256 as a large file")
+        if sum(len(v) for x, v in inline.items() if work is None or x not in work.derived.small) > self.s.publish_inline_max:
             raise PublishError(413, "TooLarge", f"inline files are limited to {self.s.publish_inline_max} bytes in all")
         torrents = {x: _b64(v, f"torrent {x[:12]}") for x, v in torrents_raw.items()}
 
@@ -214,6 +335,8 @@ class Ingest:
             new_bytes += size
         if table is not None and m.files_x and not self.store.blob_complete(m.files_x):
             new_bytes += len(table)
+        if work is not None:
+            new_bytes += work.pack_size
 
         reserved = sum(j.reserved for j in self.jobs.values() if j.signer == m.pubkey and j.state == "pulling")
         used = self.store.charged_bytes(m.pubkey)
@@ -236,7 +359,7 @@ class Ingest:
             job.files[x]["state"] = "pulling"
         if table is not None and m.files_x and not self.store.blob_complete(m.files_x):
             self._put_small(m.files_x, table)
-        task = asyncio.create_task(self._run(job, m, table, need_swarm, have_inline))
+        task = asyncio.create_task(self._run(job, m, table, need_swarm, have_inline, work))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         self.metrics.inc("thub_publish_total", result="started")
@@ -251,10 +374,15 @@ class Ingest:
         tmp.replace(path)
         self.store.put_blob(BlobRow(x, len(data), x, "complete", None, None, time.time()))
 
-    async def _run(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict) -> None:
+    async def _run(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict, work: GitWork | None = None) -> None:
         try:
             await asyncio.wait_for(self._pull(job, need), timeout=self.s.publish_timeout)
-            self._publish(job, m, table, need, inline)
+            if work is not None:
+                async with self._lock(m.repo):
+                    await asyncio.to_thread(self._git_finish, m, work)
+                    self._publish(job, m, table, need, inline, work)
+            else:
+                self._publish(job, m, table, need, inline)
             job.state = "done"
             self.metrics.inc("thub_publish_total", result="done")
             log.info("published %s@%s for %s: %d files", m.repo, m.commit[:12], m.pubkey[:12], len(m.rows))
@@ -266,6 +394,8 @@ class Ingest:
             log.exception("publication %s failed", job.id)
             self._fail(job, need, f"{type(e).__name__}: {e}")
         finally:
+            if work is not None:
+                shutil.rmtree(work.tmp, ignore_errors=True)
             job.reserved = 0
             job.finished = time.time()
 
@@ -322,13 +452,15 @@ class Ingest:
         job.files[x]["state"] = "stored"
         job.files[x]["bytes"] = size
 
-    def _publish(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict) -> None:
+    def _publish(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict, work: GitWork | None = None) -> None:
         """Make the repo visible. Charges, then commit and refs in one transaction each, then the
         manifest, so a reader that sees a ref finds every blob behind it."""
         for _path, size, x, _ in m.rows:
             self.store.charge(m.pubkey, x, size)
         if table is not None and m.files_x:
             self.store.charge(m.pubkey, m.files_x, len(table))
+        if work is not None:
+            self.store.charge(m.pubkey, f"git-{work.pack_sha}", work.pack_size)
         info = info_from_rows(m.repo, m.commit, m.rows)
         files = [FileRec(p, size, x, x, True) for p, size, x, _ in m.rows]
         self.store.mark_published(m.repo, m.pubkey)
@@ -354,9 +486,18 @@ def Manifest_seq(ev: dict) -> tuple[str, int, tuple]:
 
     try:
         body = json.loads(ev["content"])
-        return ev["id"], int(body.get("seq", 0)) if body.get("v") == 2 else 0, tuple(body.get("refs", ()))
+        return ev["id"], int(body.get("seq", 0)) if body.get("v") in (2, 3) else 0, tuple(body.get("refs", ()))
     except (KeyError, ValueError, TypeError):
         return ev.get("id", ""), 0, ()
+
+
+def Manifest_version(ev: dict) -> int:
+    import json
+
+    try:
+        return int(json.loads(ev["content"]).get("v", 0))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        return 0
 
 
 def _sha256_file(path: Path) -> str:

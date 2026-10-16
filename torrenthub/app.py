@@ -23,7 +23,7 @@ from .metrics import Metrics
 from .gaplog import GapLog
 from .mirror import Inflight, Mirror
 from .policy import check_file, load_policy
-from .publish import Ingest, PublishError
+from .publish import REPO_NAME, Ingest, PublishError
 from .store import Store, valid_key
 from .swarm import Swarm, make_swarm
 from .torrent import magnet
@@ -553,6 +553,15 @@ def create_app(
             metrics.inc("thub_publish_total", result="refused")
             raise HubError(e.status, e.code, e.message) from None
         return JSONResponse(out, status_code=200 if out.get("already") else 202)
+
+    @app.get("/api/thub/git/{owner}/{name}/refs")
+    async def git_refs(owner: str, name: str):
+        """Where each branch of a git backed published repo is. A publisher asks before it makes a
+        pack, so it sends only what the hub lacks."""
+        repo = f"{owner}/{name}"
+        if not REPO_NAME.fullmatch(repo):
+            raise HubError(400, "BadRequest", "not a repo id")
+        return {"repo": repo, "refs": ingest.git_refs(repo)}
 
     @app.get("/api/thub/publish/{job_id}")
     async def publish_status(job_id: str):

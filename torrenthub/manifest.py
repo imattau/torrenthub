@@ -14,6 +14,12 @@ stops being worth believing, so a hub that withholds a newer one cannot keep ser
 forever. `files_x` moves a large file table out of the event into a blob whose sha256 the event
 signs, so the event stays small. Version 1 manifests are still read and rank as seq 0.
 
+Version 3 (HOSTING.md) is for a repo that lives in git. `commit` is a real git commit id, `git`
+repeats its tree and parents (and says whether the publisher means to rewrite history), and
+`table_sha256` binds the file table. The table is still carried, because readers use it, but a
+hub that takes a version 3 manifest derives the table from the git objects and refuses any that
+disagree.
+
 Kind 36777 is in the addressable range (30000 to 39999). It was checked against the NIPs README
 table and the NIPs repo on 2026-10-16: no collisions, but nobody has registered it for this.
 Change MANIFEST_KIND if a NIP ever claims it.
@@ -57,6 +63,7 @@ class Manifest:
     valid_until: int | None = None
     files_x: str | None = None  # sha256 of the table blob, when the rows are not in the event
     files_i: str | None = None  # infohash of that blob, if the creator seeds it
+    git: dict | None = None  # version 3: {"tree", "parents", "force"}; None for a repo that never lived in git
 
     def expired(self, now: float | None = None) -> bool:
         return self.valid_until is not None and (time.time() if now is None else now) >= self.valid_until
@@ -123,6 +130,37 @@ def build_manifest(secret: bytes, repo_id: str, info: dict, refs: list[str], cre
     return sign_event(secret, MANIFEST_KIND, tags, _dump(body), ts)
 
 
+def build_git_manifest(secret: bytes, repo_id: str, commit: str, tree: str, parents, rows, refs: list[str], created_at: int | None = None, *,
+                       seq: int, valid_until: int | None = None, table_blob: bool | None = None, files_i: str | None = None,
+                       force: bool = False) -> dict:
+    """A signed version 3 manifest for a git commit. `rows` is the file table that `gitrepo.derive`
+    gives for it."""
+    for what, v in (("commit", commit), ("tree", tree), *(("parent", p) for p in parents)):
+        if not isinstance(v, str) or not SHA40.match(v):
+            raise ValueError(f"{what} is not a 40 hex git id")
+    if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+        raise ValueError("seq must be a whole number of 1 or more")
+    ts = int(created_at if created_at is not None else time.time())
+    if valid_until is not None and (isinstance(valid_until, bool) or not isinstance(valid_until, int) or valid_until <= ts):
+        raise ValueError("valid_until must be a time after created_at")
+    rows = tuple(tuple(r) for r in rows)
+    refs_s = sorted(set(refs))
+    x = table_sha256(rows)
+    body = {"v": 3, "repo": repo_id, "commit": commit, "refs": refs_s, "seq": seq, "valid_until": valid_until,
+            "git": {"tree": tree, "parents": list(parents), "force": bool(force)}, "table_sha256": x}
+    tags = [["d", f"{repo_id}@{commit}"], ["repo", repo_id], ["commit", commit]] + [["ref", r] for r in refs_s] + [["seq", str(seq)]]
+    if table_blob is None:
+        table_blob = len(rows) > INLINE_ROWS
+    if table_blob:
+        if files_i is not None and not re.match(r"^([0-9a-f]{40}|[0-9a-f]{64})$", files_i):
+            raise ValueError("bad files_i")
+        body.update({"files_x": x, "files_i": files_i, "files_n": len(rows)})
+        tags.append(["files_x", x])
+    else:
+        body["files"] = [list(r) for r in rows]
+    return sign_event(secret, MANIFEST_KIND, tags, _dump(body), ts)
+
+
 def with_table(m: Manifest, table: bytes) -> Manifest:
     """Complete a v2 manifest whose rows live in a blob. Checks the bytes against the signed hash."""
     if not m.files_x:
@@ -155,14 +193,14 @@ def verify_manifest(ev: dict, allowed: set[str], repo_id: str, table: bytes | No
             raise ManifestInvalid("bad id or signature")
         body = json.loads(ev["content"])
         v = body.get("v")
-        if v not in (1, 2) or body.get("repo") != repo_id:
-            raise ManifestInvalid("not a version 1 or 2 manifest for this repo")
+        if v not in (1, 2, 3) or body.get("repo") != repo_id:
+            raise ManifestInvalid("not a version 1, 2 or 3 manifest for this repo")
         commit = body["commit"]
         if not isinstance(commit, str) or not SHA40.match(commit):
             raise ManifestInvalid("bad commit")
         refs = body["refs"]
-        seq, valid_until, files_x, files_i = 0, None, None, None
-        if v == 2:
+        seq, valid_until, files_x, files_i, git = 0, None, None, None, None
+        if v in (2, 3):
             seq, valid_until = body["seq"], body.get("valid_until")
             if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
                 raise ManifestInvalid("bad seq")
@@ -180,6 +218,19 @@ def verify_manifest(ev: dict, allowed: set[str], repo_id: str, table: bytes | No
             if sorted(t[1] for t in ev["tags"] if len(t) >= 2 and t[0] == "files_x") != ([files_x] if files_x else []):
                 raise ManifestInvalid("tags disagree with the signed content")
         files = body.get("files", [])
+        if v == 3:
+            git = body.get("git")
+            if (not isinstance(git, dict) or set(git) != {"tree", "parents", "force"} or not isinstance(git["tree"], str) or not SHA40.match(git["tree"])
+                    or not isinstance(git["parents"], list) or len(git["parents"]) > 16
+                    or not all(isinstance(p, str) and SHA40.match(p) for p in git["parents"]) or not isinstance(git["force"], bool)):
+                raise ManifestInvalid("bad git field")
+            tx = body.get("table_sha256")
+            if not (isinstance(tx, str) and SHA64.match(tx)):
+                raise ManifestInvalid("bad table_sha256")
+            if files_x is not None and tx != files_x:
+                raise ManifestInvalid("table_sha256 and files_x disagree")
+            if files_x is None and tx != table_sha256(tuple(tuple(r) for r in files)):
+                raise ManifestInvalid("table_sha256 is not the hash of the files")
         if not isinstance(refs, list) or not all(isinstance(r, str) for r in refs):
             raise ManifestInvalid("bad refs")
         tag_refs = sorted(t[1] for t in ev["tags"] if len(t) >= 2 and t[0] == "ref")
@@ -187,7 +238,7 @@ def verify_manifest(ev: dict, allowed: set[str], repo_id: str, table: bytes | No
         if tag_commit != [commit] or tag_refs != sorted(refs):
             raise ManifestInvalid("tags disagree with the signed content")
         m = Manifest(ev["id"], ev["pubkey"], int(ev["created_at"]), repo_id, commit, tuple(refs),
-                     None if files_x else tuple(tuple(r) for r in files), ev, seq, valid_until, files_x, files_i)
+                     None if files_x else tuple(tuple(r) for r in files), ev, seq, valid_until, files_x, files_i, git)
         return with_table(m, table) if (files_x and table is not None) else m
     except ManifestInvalid:
         raise

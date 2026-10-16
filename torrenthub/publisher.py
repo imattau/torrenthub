@@ -23,7 +23,8 @@ from urllib.parse import quote, urlparse
 import httpx
 
 from .federation import fingerprint
-from .manifest import build_manifest, content_commit, table_bytes
+from . import gitrepo
+from .manifest import build_git_manifest, build_manifest, content_commit, table_bytes
 from .torrent import PieceHasher, build_torrent, choose_piece_length
 
 TORRENT_MIN = 1024 * 1024  # files at least this big go by torrent, smaller ones are sent in the request
@@ -73,6 +74,34 @@ class Publication:
     stage: Path
 
 
+def _stage(body: dict, stage: Path, torrents: dict, state: dict, sha: str, source: Path, size: int, pieces: bytes,
+           trackers, *, label: str) -> None:
+    """Send a small file in the request, or make a torrent for a big one and put the bytes where
+    libtorrent will look for them (under the torrent's name)."""
+    if sha in state["seen"]:
+        return
+    state["seen"].add(sha)
+    if size < TORRENT_MIN and state["inline_used"] + size <= INLINE_BUDGET:
+        body["inline"][sha] = base64.b64encode(source.read_bytes()).decode()
+        state["inline_used"] += size
+        return
+    data, _ih = build_torrent(name=sha, length=size, piece_length=choose_piece_length(size), pieces=pieces,
+                              trackers=trackers or [], comment="torrenthub publication")
+    tpath = stage / f"{sha}.torrent"
+    tpath.write_bytes(data)
+    body["torrents"][sha] = base64.b64encode(data).decode()
+    torrents[sha] = (tpath, data)
+    target = stage / sha
+    if not target.exists():
+        try:
+            os.link(source, target)
+        except OSError:
+            try:
+                shutil.copyfile(source, target) if size < (64 << 20) else target.symlink_to(source.resolve())
+            except OSError as e:
+                raise ValueError(f"cannot stage {label}: {e}") from e
+
+
 def prepare(secret: bytes, repo: str, root: Path, stage: Path, *, refs=("main",), seq: int = 1, valid_for: float | None = None,
             trackers: list[str] | None = None, created_at: int | None = None) -> Publication:
     items = scan(root)
@@ -88,30 +117,10 @@ def prepare(secret: bytes, repo: str, root: Path, stage: Path, *, refs=("main",)
         body["table"] = base64.b64encode(table_bytes(rows)).decode()
     stage = Path(stage)
     stage.mkdir(parents=True, exist_ok=True)
-    torrents, inline_used, seen = {}, 0, set()
+    state = {"inline_used": 0, "seen": set()}
+    torrents = {}
     for i in items:
-        if i.sha256 in seen:
-            continue
-        seen.add(i.sha256)
-        if i.size < TORRENT_MIN and inline_used + i.size <= INLINE_BUDGET:
-            body["inline"][i.sha256] = base64.b64encode(i.source.read_bytes()).decode()
-            inline_used += i.size
-            continue
-        data, _ih = build_torrent(name=i.sha256, length=i.size, piece_length=choose_piece_length(i.size), pieces=i.pieces,
-                                  trackers=trackers or [], comment="torrenthub publication")
-        tpath = stage / f"{i.sha256}.torrent"
-        tpath.write_bytes(data)
-        body["torrents"][i.sha256] = base64.b64encode(data).decode()
-        torrents[i.sha256] = (tpath, data)
-        target = stage / i.sha256  # libtorrent looks for the file under the torrent's name
-        if not target.exists():
-            try:
-                os.link(i.source, target)
-            except OSError:
-                try:
-                    shutil.copyfile(i.source, target) if i.size < (64 << 20) else target.symlink_to(i.source.resolve())
-                except OSError as e:
-                    raise ValueError(f"cannot stage {i.path}: {e}") from e
+        _stage(body, stage, torrents, state, i.sha256, i.source, i.size, i.pieces, trackers, label=i.path)
     return Publication(body, ev, commit, torrents, stage)
 
 
@@ -125,7 +134,7 @@ async def next_seq(client: httpx.AsyncClient, hub: str, repo: str, ref: str) -> 
         for ev in r.json().get("events", []):
             try:
                 body = json.loads(ev["content"])
-                if ref in body.get("refs", []) and body.get("v") == 2:
+                if ref in body.get("refs", []) and body.get("v") in (2, 3):
                     top = max(top, int(body["seq"]))
             except (KeyError, ValueError, TypeError):
                 continue
@@ -163,3 +172,70 @@ async def publish(hub: str, pub: Publication, swarm, *, timeout: float = 3600.0,
             for sha, (tpath, _data) in pub.torrents.items():  # re-dial in case the first attempt raced the hub's setup
                 await swarm.connect(tpath, host, port)
         raise RuntimeError(f"not finished within {timeout:.0f}s")
+
+
+def prepare_git(secret: bytes, repo: str, git_dir: Path, stage: Path, *, rev: str = "HEAD", refs=("main",), seq: int = 1,
+                valid_for: float | None = None, trackers: list[str] | None = None, created_at: int | None = None,
+                have: list[str] | None = None, extra_dirs: list[Path] | None = None, force: bool = False,
+                blob_max: int = 8 * 1024 * 1024, small_total: int = 64 * 1024 * 1024, max_files: int = 5000) -> Publication:
+    """A publication of one commit of a git repository. `have` are commits the hub already holds
+    (from /api/thub/git/<repo>/refs): only the objects after them are sent. Big files are the ones
+    the tree names with LFS pointers; their bytes are found in the working tree, in git-lfs's
+    cache, or in `extra_dirs`, and each is checked against its pointer."""
+    git_dir = Path(git_dir)
+    if not git_dir.is_dir():
+        raise ValueError(f"{git_dir} is not a directory")
+    try:
+        head = gitrepo.local_commit(git_dir, rev)
+        d = gitrepo.derive(git_dir, head, blob_max=blob_max, small_total=small_total, max_files=max_files, sandbox=False)
+    except gitrepo.GitError as e:
+        raise ValueError(str(e)) from e
+    ts = int(created_at if created_at is not None else time.time())
+    ev = build_git_manifest(secret, repo, head, d.tree, d.parents, d.rows, list(refs), created_at=ts, seq=seq,
+                            valid_until=int(ts + valid_for) if valid_for else None, force=force)
+    body: dict = {"manifest": ev, "inline": {}, "torrents": {}}
+    if any(t[0] == "files_x" for t in ev["tags"]):
+        body["table"] = base64.b64encode(table_bytes(d.rows)).decode()
+    known = [h for h in (have or []) if gitrepo.local_has(git_dir, h)]
+    try:
+        pack = gitrepo.make_pack(git_dir, head, known)
+    except gitrepo.GitError as e:
+        raise ValueError(str(e)) from e
+    body["git"] = {"head": head, "pack": base64.b64encode(pack).decode()}
+
+    stage = Path(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    # Big files the hub already holds, through a commit it has, are not hashed or sent again.
+    held: set[str] = set()
+    for h in known:
+        try:
+            held |= set(gitrepo.derive(git_dir, h, blob_max=blob_max, small_total=small_total, max_files=max_files, sandbox=False).big)
+        except gitrepo.GitError:
+            continue
+    where = {}
+    for path, size, oid, _ in d.rows:
+        if oid in d.big and oid not in where and oid not in held:
+            src = gitrepo.find_big_file(git_dir, path, oid, size, [Path(x) for x in (extra_dirs or [])])
+            if src is None:
+                raise ValueError(f"{path}: the commit points at {oid[:12]} ({size:,} bytes) and no file with that size was found in the working tree, git-lfs's cache or --files-from")
+            where[oid] = (src, size)
+    state = {"inline_used": 0, "seen": set()}
+    torrents: dict = {}
+    for oid, (src, size) in where.items():
+        h, ph = hashlib.sha256(), PieceHasher(choose_piece_length(size))
+        with open(src, "rb") as f:
+            while chunk := f.read(1 << 20):
+                h.update(chunk)
+                ph.update(chunk)
+        if h.hexdigest() != oid:
+            raise ValueError(f"{src} does not hash to the oid its pointer names ({oid[:12]}); is it the right version of the file?")
+        _stage(body, stage, torrents, state, oid, src, size, ph.finish(), trackers, label=str(src))
+    return Publication(body, ev, head, torrents, stage)
+
+
+async def hub_heads(client: httpx.AsyncClient, hub: str, repo: str) -> list[str]:
+    """The commits the hub holds at the head of each branch of a git backed repo."""
+    r = await client.get(f"{hub}/api/thub/git/{quote(repo, safe='/')}/refs")
+    if r.status_code != 200:
+        return []
+    return sorted(set(r.json().get("refs", {}).values()))

@@ -131,6 +131,8 @@ Not covered: a recently created repo (the probe's own advice), gated repos, shar
 
 On the VMs: a publisher with every inbound packet dropped (the hub could not open any connection to it, or ping it) ran `torrenthub publish` for `Qwen/Qwen2.5-0.5B` (954 MB). The hub took it in 4.8 s, and an agent pinning the publisher's key fetched it 100% over the swarm with all 10 files identical to the source. It does not exercise a real router or carrier grade NAT. Details and limits are in `PROTOCOL.md` section 15.
 
+The same setup was reused for the git backed gate (H1, `PROTOCOL.md` section 18): the publisher VM again dropped every inbound packet (the hub could neither ping it nor open port 6881), `git` was installed on both VMs, and a git repo of the same model (weights as an LFS pointer, eight small files as plain blobs) was published with `torrenthub publish --git`. 9.6 s in all, 4.0 s of it the hub pulling 988 MB; a stock `huggingface_hub` on the host fetched all nine files identical to the publisher's; the hub's bare repository passed `git fsck --strict`. A README-only second commit sent no big file and took under a second; a rewritten history was refused with `409 NotFastForward`. Same limits as before: a virtual bridge, not a real router.
+
 ## A request cycle between machines (P5)
 
 Hub and one worker on two VMs, the requester and a second worker on this host. `hash_verified` of the 954 MB published model by one worker was accepted in 11 s; `format_scan` of the same file by two independent workers in 10 s; a requester no one had endorsed was refused. Trust was set up beforehand by an operator key. Details in `PROTOCOL.md` section 16.

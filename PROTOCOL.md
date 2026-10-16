@@ -191,6 +191,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P4 (built, section 15; gate met in a simulation of NAT, not behind a real router) | Publishing path for artifacts (seed, announce, hub pulls by infohash), quotas, manifest v2 with `seq`, `valid_until`, `files_x` | A publisher behind NAT gets an artifact onto a hub, and an agent fetches it with full verification |
 | P5 (built, section 16; gate met on two machines, with trust set up beforehand) | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
 | P6 (built, section 17; gate met against a local strfry and a lenient relay, not a public one) | Nostr relay adapter | Events round trip through a real relay, with size limits known |
+| H1 (built, section 18; `HOSTING.md`) | Git backed publishing: manifest v3, `publish --git`, the hub derives the file table from the git objects | A git repo with pointers is published from behind a firewall and fetched verified; hostile packs are refused |
 
 Public service questions (who pays for the first copy, takedown and abuse policy, IP exposure) stay open in `ARCHITECTURE.md` and are not answered by any phase above.
 
@@ -405,3 +406,26 @@ Every participant event fits under 64 KiB with room to spare. Manifests are the 
 - Pagination assumes a relay honours `until` and a `limit` up to its own cap; more than a page of events in one second from one key would stall the walk.
 - Throughput and behaviour under load were not measured.
 
+## 18. What is built (H1: git backed publishing)
+
+Design and reasons: `HOSTING.md`. Code: `gitrepo.py` (running git safely, deriving a commit's file table, the publisher's helpers), `manifest.py` (`build_git_manifest`, version 3), the git branch of `publish.py`, `prepare_git` and `hub_heads` in `publisher.py`, `torrenthub publish --git`, and `GET /api/thub/git/<owner>/<name>/refs`. Tests: `tests/test_git_publish.py`.
+
+**Manifest version 3.** `commit` is a git commit id. The signed content adds `git: {tree, parents, force}` and `table_sha256`, and keeps the file table (inline or as `files_x`) because readers use it. Readers verify it like version 2 (`seq`, `valid_until`, tags that must agree with the signed content). A version 3 manifest without a well formed `git` field, or whose `table_sha256` is not the hash of its table, is invalid.
+
+**The table follows from the commit.** Big files are LFS pointer files in the tree (exactly three lines: version, `oid sha256:<64 lowercase hex>`, `size <decimal>`); anything that starts like a pointer and is not exactly one is refused. Every other file is a plain git blob and its row is its sha256. `gitrepo.derive` produces the rows the same way for the publisher and for the hub, and the hub refuses a manifest whose table differs.
+
+**What the hub checks, in this order**, each with a test that fails when the check is removed: the manifest signature and the signer's authority (as before); the repo is not mixed (a repo is git backed or not from its first publication); `seq` (before any git runs); the pack is indexed in a throwaway repository with `git index-pack --strict --fix-thin` (no system or user config, no hooks, no templates, a time limit, a file size limit); the commit is present and the history complete; the tree has no symlinks, submodules, `.git` component, unsafe path, or two paths that differ only in case; no plain file is over `THUB_PUBLISH_GIT_BLOB_MAX`; the table, tree and parents match the manifest; each branch moves forward only (the new commit descends from the current head) unless the manifest says `force` **and** the hub has `THUB_PUBLISH_ALLOW_FORCE`. The branches are checked again after the transfer, immediately before they move, because another publication may have moved one meanwhile. Only when every file has arrived and been hashed does the hub keep the objects (a bare repository at `<data>/git/<owner>__<name>.git`, branches in `refs/heads`) and show the repo. The pack's size is charged to the signer's quota like a file.
+
+**Publisher.** `prepare_git` reads the committed state of one commit (not the working tree), derives the table, builds a pack of what the hub lacks (the hub's branch heads come from the refs endpoint), and finds each big file's bytes in the working tree, in git-lfs's cache (`.git/lfs/objects`), in `.git/thub/objects`, or in a folder given with `--files-from`. Each file is hashed once and must match its pointer. A big file reachable from a commit the hub already holds is neither hashed nor sent.
+
+**Measured.** On the VMs (publisher with every inbound packet dropped, as in section 15): a git repo of Qwen2.5-0.5B (9 files, 988 MB, weights as a pointer, the rest plain) published in 9.6 s in all, 4.0 s of it the hub pulling the weights; the served commit id was git's own, all nine files fetched through a stock `huggingface_hub` were identical to the publisher's, and the hub's repository passed `git fsck --strict`. A second commit (README edit) took under a second and sent no big file. A rewritten history was refused with `409 NotFastForward`.
+
+**Not done, on purpose.**
+- A consumer of the HF API cannot see the git objects. The table is still what readers verify; what the git objects add today is the history on the hub and the hub's refusal of a table that disagrees with the commit. The `commits` and `compare` endpoints, `torrenthub host`, a git remote helper and `git clone` are later stages (HOSTING.md).
+- No `.gitattributes` filter writes pointers: use git-lfs, or write the three lines yourself. The hub needs no git-lfs.
+- `index-pack` inflates what it receives. Measured: a 4.2 MB pack holding one 4 GiB file of zeros took 8.8 s to index; with a 3 s limit it was stopped after 3.0 s and left nothing (`THUB_PUBLISH_GIT_TIMEOUT`, default 60 s per command, two at a time; a test covers the limit). So a signer the hub has authorised can make it spend up to a minute of one core per publication. Strangers cannot: the authority check runs before any git command.
+- A commit id is SHA-1. A colliding tree could carry different plain files under one id. Big files are bound by sha256. `table_sha256` is the second binding for the whole table.
+- Removing a repo or rewriting it for a leaked file is not built. With `force` a branch can be moved, but the old objects stay in the hub's repository.
+- Only the command line was exercised.
+- A repo cannot change between git backed and not. Refused with `409 WrongKind`.
+- Default limits: 100,000 objects of history, 32 MiB of pack, 8 MiB per plain file, 64 MiB of plain files in a commit, 5,000 files.

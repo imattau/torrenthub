@@ -63,7 +63,11 @@ def add_event_commands(sub) -> None:
     sp = sub.add_parser("publish", help="publish a directory as a signed repo on a hub; works from behind NAT (the hub never connects to you)")
     _key_args(sp)
     sp.add_argument("--repo", required=True, help="owner/name")
-    sp.add_argument("--dir", required=True)
+    sp.add_argument("--dir", help="a folder of files (a snapshot, no history)")
+    sp.add_argument("--git", metavar="DIR", help="a git repository: publish one commit, with its history. Big files are LFS pointers in the tree; their bytes are found in the working tree or git-lfs's cache")
+    sp.add_argument("--commit", default="HEAD", help="with --git: the commit to publish (default HEAD)")
+    sp.add_argument("--files-from", action="append", default=[], metavar="DIR", help="with --git: another folder to look in for big files (by path or by sha256)")
+    sp.add_argument("--force", action="store_true", help="with --git: say the branch is meant to be rewritten (the hub must allow it)")
     sp.add_argument("--hub", required=True, help="base URL of a hub that takes publications")
     sp.add_argument("--ref", action="append", help="branch name the manifest claims (default main)")
     sp.add_argument("--seq", default="auto", help="the manifest counter; auto asks the hub for the next one")
@@ -322,14 +326,26 @@ def run_event_command(args, settings, p) -> None:
             secret = _secret(args, p)
             refs = tuple(args.ref or ["main"])
             hub = args.hub.rstrip("/")
+            if bool(args.dir) == bool(args.git):
+                raise SystemExit("error: give exactly one of --dir and --git")
 
             async def go():
                 async with httpx.AsyncClient(timeout=30) as client:
                     seq = await next_seq(client, hub, args.repo, refs[0]) if args.seq == "auto" else int(args.seq)
                 stage = Path(args.stage) if args.stage else Path(tempfile.mkdtemp(prefix="thub-publish-"))
-                print(f"hashing {args.dir} ...", flush=True)
-                pub = prepare(secret, args.repo, Path(args.dir), stage, refs=refs, seq=seq,
-                              valid_for=args.valid_days * 86400 if args.valid_days else None, trackers=args.tracker)
+                if args.git:
+                    from .publisher import hub_heads, prepare_git
+
+                    async with httpx.AsyncClient(timeout=30) as client:
+                        have = await hub_heads(client, hub, args.repo)
+                    print(f"reading {args.git} at {args.commit} ({len(have)} commits already on the hub) ...", flush=True)
+                    pub = prepare_git(secret, args.repo, Path(args.git), stage, rev=args.commit, refs=refs, seq=seq, have=have,
+                                      valid_for=args.valid_days * 86400 if args.valid_days else None, trackers=args.tracker,
+                                      extra_dirs=[Path(x) for x in args.files_from], force=args.force)
+                else:
+                    print(f"hashing {args.dir} ...", flush=True)
+                    pub = prepare(secret, args.repo, Path(args.dir), stage, refs=refs, seq=seq,
+                                  valid_for=args.valid_days * 86400 if args.valid_days else None, trackers=args.tracker)
                 print(f"commit {pub.commit}, seq {seq}, {len(pub.body['inline'])} small and {len(pub.torrents)} big files", flush=True)
                 swarm = LibtorrentSwarm(0, dht=False)
                 last = [""]
