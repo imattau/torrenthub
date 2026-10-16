@@ -32,6 +32,10 @@ New surface: a hub runs `git` on objects a publisher chose. The measures are in 
 
 `torrenthub host` is a hub that listens (on every address unless `--bind` says otherwise) and holds the owner's signing key in a process that stays up. The key is read from a file and is not behind the signer process: whoever can read the file, or the process, can sign as the owner. The host serves files by link from the owner's working tree, so what it serves depends on files the owner or another program can change; a change is noticed within one poll and the file is withdrawn, but not before. It takes no uploads (publishing is off) and asks no upstream. It was not tested against a malicious consumer beyond the ordinary hub endpoints.
 
+## Plain git (added with H3)
+
+The client side runs `git index-pack --strict` on a pack the hub sends, in the user's own repository, and then checks that the commit is the one a manifest signed by a pinned key names and that its file table is the signed one; a hub that lies gets an error. What that does not cover: the signer must be pinned from a trustworthy source (a first clone cannot discover it); delegations are not followed; a hub can still serve an older signed manifest (freshness); a commit id is SHA-1, so the table check (sha256 of every big file and every plain file) is what carries the weight; the helper and filter read the signing key and downloaded bytes with the user's own permissions. The pack endpoint on the hub is public for served commits, rate limited per address, size capped and limited to two git processes at a time; it refuses commits that are not a served head or part of its history. Not reviewed: git's pack parser on hostile input on the client side (git is a dependency we did not read), and a deliberately slow or huge pack from a hostile hub (the client's index-pack has a 10 minute limit and no size limit beyond the disk).
+
 ## Dependencies
 
 `pip-audit` (2026-10-16) found no known vulnerabilities in `lock/runtime.txt` (36 packages, everything a deployment installs) or `lock/dev.txt`. The earlier run's only findings were against `pip` 24.0 in a development environment, since upgraded.

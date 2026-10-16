@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "filter", "git-init", "pull-files", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -88,6 +88,18 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--bind", default="0.0.0.0")
     sp.add_argument("--port", type=int, default=8080)
     sp.add_argument("--listen-port", type=int, default=6881, help="swarm port")
+
+    sp = sub.add_parser("filter", help="the git filter for big files (run by git, not by hand): clean turns a file into a pointer, smudge turns it back")
+    sp.add_argument("mode", choices=["clean", "smudge"])
+    sp.add_argument("path", nargs="?", help="the file's name (git passes it; unused)")
+
+    sp = sub.add_parser("git-init", help="set up the big-file filter in this git repository and write .gitattributes, so git add makes pointers without git-lfs")
+    sp.add_argument("--pattern", action="append", help="file pattern to treat as big (repeatable; default: common model formats)")
+    sp.add_argument("--dir", default=".")
+
+    sp = sub.add_parser("pull-files", help="replace the pointer files in this working tree by the files they name, fetched from the hub of a thub remote")
+    sp.add_argument("--dir", default=".")
+    sp.add_argument("--hub", action="append", help="hub URL to fetch from (default: thub.hub and the thub remotes)")
 
     sp = sub.add_parser("request", help="ask for work and wait for an answer you trust (judged by THUB_ROOTS, not by the hub)")
     _key_args(sp)
@@ -399,6 +411,36 @@ def run_event_command(args, settings, p) -> None:
             print(json.dumps({"hosting": args.repo, "git": args.git, "pubkey": pk, "url": s.public_url, "branches": list(host.branches)}), flush=True)
             print(f"consumers pin it with: THUB_TRUST='{args.repo}=signed:{pk}' THUB_UPSTREAM={s.public_url}", flush=True)
             uvicorn.run(app, host=args.bind, port=args.port)
+        elif c == "filter":
+            from . import pointers
+
+            gd = pointers.git_dir()
+            try:
+                if args.mode == "clean":
+                    pointers.clean(sys.stdin.buffer, sys.stdout.buffer, gd)
+                else:
+                    pointers.smudge(sys.stdin.buffer, sys.stdout.buffer, gd, pointers.hubs_for())
+            except Exception as e:  # noqa: BLE001
+                print(f"torrenthub filter {args.mode}: {e}", file=sys.stderr)
+                raise SystemExit(1)
+            sys.stdout.buffer.flush()
+        elif c == "git-init":
+            from . import pointers
+
+            try:
+                out = pointers.install(Path(args.dir), tuple(args.pattern) if args.pattern else pointers.DEFAULT_PATTERNS)
+            except Exception as e:  # noqa: BLE001
+                raise SystemExit(f"error: {e}")
+            print(json.dumps(out))
+            print("big files matching those patterns now become pointers when added, and are fetched when checked out", file=sys.stderr)
+        elif c == "pull-files":
+            from . import pointers
+
+            try:
+                done = pointers.materialize(Path(args.dir), [h.rstrip("/") for h in args.hub] if args.hub else None)
+            except Exception as e:  # noqa: BLE001
+                raise SystemExit(f"error: {e}")
+            print(json.dumps({"filled": done}))
         elif c == "revoke":
             target = key(args.target) if args.kind == "key" else args.target
             succ = key(args.successor) if args.successor else None

@@ -314,10 +314,10 @@ def local_has(repo: Path, sha: str) -> bool:
     return rc == 0
 
 
-def make_pack(repo: Path, head: str, have: list[str]) -> bytes:
-    """A pack with everything `head` needs that the hub does not already have."""
+def make_pack(repo: Path, head: str, have: list[str], *, fsize: int = 1 << 31, timeout: float = 600.0, sandbox: bool = False) -> bytes:
+    """A pack with everything `head` needs that the other side does not already have."""
     revs = head + "\n" + "".join(f"^{h}\n" for h in have if SHA40.fullmatch(h))
-    _, out, _ = run_git(["-C", str(repo), "pack-objects", "--revs", "--stdout", "--quiet"], stdin=revs.encode(), fsize=1 << 31, timeout=600.0)
+    _, out, _ = run_git(["-C", str(repo), "pack-objects", "--revs", "--stdout", "--quiet"], stdin=revs.encode(), fsize=fsize, timeout=timeout, sandbox=sandbox)
     return out
 
 

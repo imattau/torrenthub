@@ -145,6 +145,8 @@ class Settings:
     publish_git_max_objects: int = 100_000  # objects in the whole history
     publish_git_timeout: float = 60.0  # per git command
     publish_allow_force: bool = False  # accept a manifest that moves a branch to a commit that does not descend from it
+    git_pack_per_ip_per_minute: float = 30.0  # pack requests per address
+    serve_git_max_pack: int = 256 * 1024 * 1024  # largest pack handed to a client that asks for objects
     # Largest request body, in bytes, read for each POST endpoint. An event is capped at 64 KiB by its parser.
     max_event_body: int = 256 * 1024
     # Requests per client address for the POST endpoints: a burst, then this many a minute. 0 turns it off.
@@ -224,6 +226,8 @@ class Settings:
             publish_git_max_objects=int(e("THUB_PUBLISH_GIT_MAX_OBJECTS", "100000")),
             publish_git_timeout=float(e("THUB_PUBLISH_GIT_TIMEOUT", "60")),
             publish_allow_force=_bool(e("THUB_PUBLISH_ALLOW_FORCE"), False),
+            git_pack_per_ip_per_minute=float(e("THUB_GIT_PACK_PER_IP_MINUTE", "30")),
+            serve_git_max_pack=parse_size(e("THUB_SERVE_GIT_MAX_PACK"), 256 * 1024 * 1024),
             publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),
             roots=parse_keys(e("THUB_ROOTS")),
             trust_hops=int(e("THUB_TRUST_HOPS", "3")),

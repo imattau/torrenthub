@@ -193,6 +193,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P6 (built, section 17; gate met against a local strfry and a lenient relay, not a public one) | Nostr relay adapter | Events round trip through a real relay, with size limits known |
 | H1 (built, section 18; `HOSTING.md`) | Git backed publishing: manifest v3, `publish --git`, the hub derives the file table from the git objects | A git repo with pointers is published from behind a firewall and fetched verified; hostile packs are refused |
 | H2 (built, section 19; `HOSTING.md`) | `torrenthub host`: serve a repo from a git repository on this machine, big files in place, a manifest signed on each branch change | One machine hosts, another pinned to the owner's key fetches from it with nothing else involved |
+| H3 (built, section 20; `HOSTING.md`) | `git-remote-thub` and a big-file filter: `git push` signs and publishes, `git clone` and `fetch` take only what a pinned key's manifest signs | A user pushes and clones with plain git, no git-lfs |
 
 Public service questions (who pays for the first copy, takedown and abuse policy, IP exposure) stay open in `ARCHITECTURE.md` and are not answered by any phase above.
 
@@ -452,3 +453,29 @@ Keeping the promise of "in place": the state of each served file (size and modif
 - One repo per host process.
 - The host listens on every address by default (`--bind`).
 - Only the command line was exercised, on Linux.
+
+## 20. What is built (H3: plain git)
+
+Design: `HOSTING.md`. Code: `gitremote.py` (the remote helper `git-remote-thub`), `pointers.py` (the big-file filter, `git-init`, `pull-files`), the pack endpoint in `app.py` and `Ingest.serve_pack` in `publish.py`. Commands: `git-remote-thub` (run by git), `torrenthub filter clean|smudge`, `torrenthub git-init`, `torrenthub pull-files`. Tests: `tests/test_gitremote.py`.
+
+**URLs.** `thub://host[:port]/owner/name` (https) or `thub::http://host:port/owner/name` (any scheme). `?signer=<key>` may be added, repeatedly.
+
+**Push.** `git push hub main` is `torrenthub publish --git` driven by git: for each branch the helper reads the hub's heads, makes a version 3 manifest for that commit with the next `seq`, sends the objects the hub lacks, seeds the big files and waits (section 18, unchanged). The key comes from `remote.<name>.thubkeyfile`, `thub.keyfile`, `THUB_KEY_FILE` or `THUB_SIGNING_KEY`. `--force` becomes `force: true`, which the hub must also allow. Git itself refuses a non-fast-forward before the helper is called. Only branches can be pushed; tags and deletions are reported as errors.
+
+**Clone and fetch trust the hub for nothing.** The branch list comes only from manifests that verify against a **pinned** key (`?signer=` in the URL, `thub.signer` in config, or `THUB_SIGNERS`); with none pinned the helper refuses, and with manifests present but none valid it says so instead of cloning an empty repository. Expired manifests are skipped and the newest `seq` wins. The hub sends a pack (`POST /api/thub/git/<repo>/pack`, objects after what the client says it has); the helper indexes it with `--strict`, then checks that each commit it asked for is exactly the one a valid manifest signs for that branch, and that the file table derived from the commit's own tree equals the table the manifest signs. A hub that sends other objects, or a signer whose table is not its commit's, gets an error and no branch. Use `git clone -c thub.signer=<key> URL` (this stores it in the new repository; `git -c ... clone` does not, and a later `fetch` would refuse).
+
+**The hub's pack endpoint** hands out only a branch head it serves or one of its ancestors (so a host's other branches and private commits stay private), at most 64 `have` ids, packs up to `THUB_SERVE_GIT_MAX_PACK` (256 MiB), two git processes at a time, and 20 requests per address then `THUB_GIT_PACK_PER_IP_MINUTE` (30) a minute. It serves a published repo from the hub's own repository and a hosted repo (section 19) from the owner's.
+
+**Big files without git-lfs.** `torrenthub git-init` sets a git filter (`filter.thub.*`, `required`) and writes `.gitattributes` for common model formats. `git add` turns a matching file into a git-lfs format pointer and keeps its bytes in `.git/thub/objects/<sha256>`; checkout turns a pointer back into the file, taking it from that cache or from the hub of the repo's `thub` remote (or `thub.hub`), and keeps it only if its sha256 and size are what the pointer says. `THUB_SKIP_SMUDGE=1` checks out pointers only; `torrenthub pull-files` fills them in later and re-registers the files with git, because git decides "modified" from the size in its index before it runs any filter (the first version of this left every filled-in file showing as modified). The pointer format is git-lfs's, so a repo made here can be used with git-lfs and the reverse.
+
+**Measured.** Two VMs: a publisher VM with every inbound packet dropped, and a hub VM. On the publisher: `torrenthub git-init`, `git add` of the 988 MB Qwen2.5-0.5B repo (5 s, the clean filter hashing and caching the weights), `git commit`, `git push` to the hub: 11.1 s in all. Then on the physical machine `git clone -c thub.signer=... thub::http://hub:8080/...` with the filter configured: 6.0 s, including 988 MB fetched during checkout; `git status` clean; all nine original files identical. Mutation checks on the helper and the endpoint: eleven of twelve safeguards were caught by a test when removed (the twelfth, a direct check that git never exercises, now has its own test; one redundant filter of unknown `have` ids is not proven needed on this git version).
+
+**Not done, and limits.**
+- Signers are pinned by key only. A delegation from a root (a `publish:<repo>` grant) is not followed on the client.
+- Big files come by HTTP from the hub, not the swarm. They are checked but not fast for many readers.
+- No tags, no shallow or partial clone, no `git push --delete`, no submodules.
+- `git clone` of a hub that is not trusted still needs the owner's key from somewhere trustworthy; a first clone cannot discover it.
+- The filter keeps a second copy of each big file in `.git/thub/objects` (as git-lfs does).
+- The helper signs with a key read from a file, as `publish` does.
+- Freshness is the same open problem as everywhere: a hub can serve an older signed manifest; `valid_until` and asking more than one hub are the defences, and the helper asks one.
+- Windows was not tried. The helper needs `git-remote-thub` on `PATH`, which pip installs next to `torrenthub`.

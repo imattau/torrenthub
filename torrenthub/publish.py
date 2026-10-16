@@ -273,6 +273,36 @@ class Ingest:
         for ref in m.refs:
             gitrepo.update_ref(perm, ref, m.commit)
 
+    def git_source(self, repo: str, host_dir: Path | None = None) -> Path | None:
+        """Where the git objects of a served repo are: the hub's own repository for a published one,
+        or the owner's repository when this process is hosting it."""
+        perm = self._perm_repo(repo)
+        if perm.exists():
+            return perm
+        return Path(host_dir) if host_dir is not None and Path(host_dir).exists() else None
+
+    async def serve_pack(self, repo: str, want: str, have: list, host_dir: Path | None = None) -> bytes:
+        """A pack that gives a client the commit `want` and its history, minus what it has. Only
+        commits this hub serves may be asked for: a branch head or one of its ancestors."""
+        if not (isinstance(want, str) and gitrepo.SHA40.fullmatch(want)) or not isinstance(have, list) or len(have) > 64 \
+                or not all(isinstance(h, str) and gitrepo.SHA40.fullmatch(h) for h in have):
+            raise PublishError(400, "BadRequest", "want and have must be 40 hex git ids (at most 64 have)")
+        src = self.git_source(repo, host_dir)
+        heads = set(self.git_refs(repo).values())
+        if src is None or not heads:
+            raise PublishError(404, "RepoNotFound", f"{repo} has no git history here")
+        async with self._git_slots:
+            return await asyncio.to_thread(self._pack, src, want, have, heads)
+
+    def _pack(self, src: Path, want: str, have: list, heads: set) -> bytes:
+        try:
+            if want not in heads and not any(gitrepo.is_ancestor(src, want, h) for h in heads):
+                raise PublishError(404, "NotServed", "that commit is not a branch head or part of one's history here")
+            known = [h for h in have if gitrepo.run_git(["cat-file", "-e", f"{h}^{{commit}}"], cwd=src, sandbox=True, ok=(0, 1, 128))[0] == 0]
+            return gitrepo.make_pack(src, want, known, fsize=self.s.serve_git_max_pack, timeout=self.s.publish_git_timeout * 2, sandbox=True)
+        except gitrepo.GitError as e:
+            raise PublishError(500, "GitFailed", str(e)) from None
+
     def git_refs(self, repo: str) -> dict:
         """Branch -> commit for a git backed repo, from the newest manifest naming each branch."""
         best: dict[str, tuple[int, str]] = {}

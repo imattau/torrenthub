@@ -238,6 +238,23 @@ torrenthub publish --repo you/model --git ./model --hub https://hub.example --ke
 
 The commit id is git's own, history is kept (the hub holds a bare git repository per repo), and a new commit must descend from the branch's current one unless you pass `--force` and the hub allows it (`THUB_PUBLISH_ALLOW_FORCE=1`). Only objects the hub lacks are sent, and big files it already holds are not hashed again. The hub needs `git` installed. Details and limits: `HOSTING.md` and `PROTOCOL.md` section 18. `torrenthub publish --git` reads the committed state, not the working tree, apart from finding the big files' bytes.
 
+## Plain git
+
+`git-remote-thub` (installed with the package) lets git talk to a hub, and `torrenthub git-init` handles big files without git-lfs:
+
+```bash
+torrenthub git-init                                   # once per repo: filter + .gitattributes for model formats
+git add model.safetensors && git commit -m "weights"  # the file becomes a pointer; its bytes stay in .git/thub/objects
+git remote add hub thub://hub.example/you/model
+git config thub.keyfile ~/.thub/key
+git push hub main                                     # signed and published, big files by torrent, works behind NAT
+
+git clone -c thub.signer=<owner key> -c filter.thub.clean="torrenthub filter clean" \
+  -c filter.thub.smudge="torrenthub filter smudge" -c filter.thub.required=true thub://hub.example/you/model
+```
+
+A clone only follows branches that a manifest signed by a pinned key vouches for, and checks the commit and its file table against that manifest; the hub is not trusted. Without the filter options a clone has pointers in place of big files; `torrenthub pull-files` fills them in. `THUB_SKIP_SMUDGE=1` does the same during checkout. Use `thub::http://host:port/you/model` for a hub without TLS. Details and limits: `PROTOCOL.md` section 20.
+
 ## Hosting from your own machine
 
 Instead of sending a repo to a hub, serve it yourself from a git repository (same layout as above: big files are LFS pointers in the tree, their bytes in the working tree or git-lfs's cache):

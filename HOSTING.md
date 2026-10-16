@@ -1,6 +1,6 @@
 # Hosting your own repository, backed by git
 
-Status: **H1 and H2 are built** (`PROTOCOL.md` sections 18 and 19 say exactly what, how they were measured, and what is not done). H3 and H4 are still design only. Written 2026-10-16 after reading `publish.py`, `manifest.py` and `mirror.py`. Where the design below and section 18 differ, section 18 is what the code does.
+Status: **H1, H2 and H3 are built** (`PROTOCOL.md` sections 18 to 20 say exactly what, how they were measured, and what is not done). H4 is still design only. Written 2026-10-16 after reading `publish.py`, `manifest.py` and `mirror.py`. Where the design below and section 18 differ, section 18 is what the code does.
 
 ## What exists, and what is missing
 

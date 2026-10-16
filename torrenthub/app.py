@@ -386,11 +386,12 @@ def create_app(
         await upstream.aclose()
 
     app = FastAPI(title="torrenthub", lifespan=lifespan)
-    app.add_middleware(BodyLimit, limits={"/api/thub/events": settings.max_event_body, "/api/thub/publish": settings.publish_max_body})
+    app.add_middleware(BodyLimit, limits={"/api/thub/events": settings.max_event_body, "/api/thub/publish": settings.publish_max_body, "/api/thub/git/": 64 * 1024})
     # added last, so it runs first: a flooding address is turned away before anything else looks at the request
     app.add_middleware(RateLimit, rules={
         "/api/thub/events": (settings.events_per_ip_burst, settings.events_per_ip_per_minute),
-        "/api/thub/publish": (10, settings.publish_per_ip_per_minute)})
+        "/api/thub/publish": (10, settings.publish_per_ip_per_minute),
+        "/api/thub/git/": (20, settings.git_pack_per_ip_per_minute)})
     app.state.mirror = mirror
     app.state.ingest = ingest
     app.state.store = store
@@ -562,6 +563,26 @@ def create_app(
         if not REPO_NAME.fullmatch(repo):
             raise HubError(400, "BadRequest", "not a repo id")
         return {"repo": repo, "refs": ingest.git_refs(repo)}
+
+    @app.post("/api/thub/git/{owner}/{name}/pack")
+    async def git_pack(owner: str, name: str, request: Request):
+        """The objects behind a served commit, for a git client (git-remote-thub). The client checks
+        the commit against the signed manifest; this only hands over bytes."""
+        repo = f"{owner}/{name}"
+        if not REPO_NAME.fullmatch(repo):
+            raise HubError(400, "BadRequest", "not a repo id")
+        try:
+            body = await request.json()
+            want, have = body["want"], body.get("have", [])
+        except (ValueError, KeyError, TypeError, RecursionError):
+            raise HubError(400, "BadRequest", "body must be JSON with want and have") from None
+        host = getattr(app.state, "host", None)
+        try:
+            pack = await ingest.serve_pack(repo, want, have, host.git_dir if host is not None and host.repo == repo else None)
+        except PublishError as e:
+            raise HubError(e.status, e.code, e.message) from None
+        metrics.inc("thub_git_pack_total")
+        return Response(pack, media_type="application/x-git-packed-objects")
 
     @app.get("/api/thub/publish/{job_id}")
     async def publish_status(job_id: str):
