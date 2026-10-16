@@ -110,7 +110,7 @@ See `ARCHITECTURE.md`, section 6c.
 | `torrenthub sign <repo> [--revision] [--ref] [--key-file]` | Sign a repo revision's file table and keep the manifest here |
 | `torrenthub manifests <repo>` | List signed manifests held for a repo |
 | `torrenthub manifest-add <file> --key <npub>` | Check and import a signed manifest |
-| `torrenthub mcp --gateway URL --download-root DIR [--max-gib N]` | MCP server (stdio) for AI agents. Needs `pip install '.[mcp]'` |
+| `torrenthub mcp --gateway URL --download-root DIR [--max-gib N] [--agent-key-file K --allow-repo GLOB --work-root DIR]` | MCP server (stdio) for AI agents; with an agent key it can also publish, record derivations, report evaluations and answer requests. Needs `pip install '.[mcp]'` |
 | `torrenthub identity / delegate / endorse / revoke` | Make a signed participant event (`--key-file`, `--out`) |
 | `torrenthub events-add FILE` | Check an event and add it to this gateway's store |
 | `torrenthub events-pull URL` | Fetch events from another gateway and add the ones that pass |
@@ -183,7 +183,7 @@ python -m pytest
 
 ## MCP server for agents
 
-`torrenthub mcp` lets an MCP client (an LLM agent) use a gateway. It has six tools: `repo_info`, `check_trust`, `fetch_file`, `verify_file`, `get_verdict` and `gateway_status`. By default it only reads and downloads. It cannot publish, sign or change the gateway, unless you start it with a signer (below).
+`torrenthub mcp` lets an MCP client (an LLM agent) use a gateway. Its first six tools are `repo_info`, `check_trust`, `fetch_file`, `verify_file`, `get_verdict` and `gateway_status`, and it has more for finding and comparing repos (below). By default it only reads and downloads. It cannot publish, sign or change the gateway, unless you start it with a signer or an agent key (below).
 
 Client config:
 
@@ -192,6 +192,33 @@ Client config:
 ```
 
 Each answer says where the hashes came from (`anchor`, `signed`, `hub` or `upstream`). With `--signer SOCKET` there is also `attest_file`, which has a separate signer process check the file and sign the result. `get_verdict` shows what the signed attestations say about a file. `fetch_file` checks the bytes against the advertised hash itself and deletes the file if they differ. Downloads stay inside `--download-root` and under `--max-gib` (default 20). Anything copied from a repo is marked as untrusted data in the results. Tested with in-process and stdio MCP clients, and driven by hand over stdio once, not with a real LLM client yet. `fetch_file` blocks until the file is done, so a very large download may hit a client timeout.
+
+### Letting an agent do research and development
+
+With its own key, an agent can do what a person does with the command line, and not only read:
+
+```
+torrenthub keygen                                   # the AGENT's own key; never give it the owner's
+torrenthub delegate --key-file owner.key --subject <agent pubkey> --scope 'publish:acme/*' --scope 'attest:*' --expires-in 604800
+torrenthub endorse  --key-file owner.key --subject <agent pubkey> --scope derive --weight 0.8   # only if its derivations should count in lineage
+# delegate and endorse print an event (add --out FILE); hand each to the hub:  curl -X POST -d @FILE $HUB/api/thub/events
+torrenthub mcp --gateway https://hub.example --download-root ./dl --work-root ./work \
+    --agent-key-file agent.key --allow-repo 'acme/*' --audit-log ./agent-audit.jsonl \
+    --max-events-per-hour 60 --max-publish-gib 50 --valid-hours 168
+```
+
+| Tool | Needs a key | What it does |
+|---|---|---|
+| `find_repos`, `repo_history`, `compare_revisions`, `download_repo`, `lineage`, `trust_of`, `list_events`, `list_requests`, `hash_local_file`, `whoami` | no | Find a repo, read its signed history (each signature checked here), see what changed between two revisions, download a whole snapshot with every hash checked, see what a file was made from, ask how far the gateway trusts a key |
+| `publish_repo` | yes | Publish a folder under `--work-root` as a signed repo. A folder with `.git` goes with its history |
+| `declare_derivation` | yes | Sign how a model was made: inputs, outputs, tool, data origin, licences |
+| `report_eval` | yes | Sign a benchmark result for a file (class R: a reported result, with the dataset hash and settings so others can redo it) |
+| `post_request`, `claim_request`, `submit_result` | yes | Ask for work, say you are on it, answer |
+| `retract_event` | yes | Withdraw one of the agent's own earlier events |
+
+The tools that sign or publish are not offered at all without `--agent-key-file`. What stops an agent doing harm with them: its key is a delegation that expires and can be revoked; it publishes only to `--allow-repo` globs and only from under `--work-root` (links that lead outside are refused); the operator's per hour and per day limits, size cap and expiry are checked in this process and counted again from the audit log after a restart; every action, signed or refused, is in the audit log. Delegating authority (`delegate`, `endorse`, `revoke` of keys) is deliberately **not** a tool: an agent cannot widen its own trust. A key the gateway does not know can still post events, but they are held in quarantine and the tool says so. Text from other participants (request arguments, notes, repo names) is labelled untrusted data in every result.
+
+Tested with 18 tests that drive the tools over a real MCP session against a real hub (publish, a second version, history, compare, download, derivation read back through lineage, an eval, two agents on one request, retraction, every limit, links, a git repo with history, and the command line flags). Not tested: a real LLM client making these choices, a long autonomous run, or any hub other than this code.
 
 ## Validating it for real
 

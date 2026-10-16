@@ -69,6 +69,15 @@ def main(argv: list[str] | None = None) -> None:
     mc.add_argument("--download-root", default="./downloads")
     mc.add_argument("--max-gib", type=float, default=20.0)
     mc.add_argument("--signer", help="Unix socket of a running signer. Adds the attest_file tool")
+    mc.add_argument("--agent-key-file", help="the AGENT's own key (not its owner's): adds publish_repo, declare_derivation, report_eval and the request tools. Delegate to it first: torrenthub delegate --subject <its key> --scope 'publish:owner/*' --expires-in SECONDS")
+    mc.add_argument("--allow-repo", action="append", default=[], metavar="GLOB", help="a repo the agent may publish to, such as 'acme/*' (repeatable; without one it cannot publish)")
+    mc.add_argument("--work-root", default="./work", help="the folder the agent may publish from and hash files in")
+    mc.add_argument("--hub", help="where to publish and post events, if not the gateway")
+    mc.add_argument("--audit-log", default="./agent-audit.jsonl", help="every action the agent key is asked to take, signed or refused")
+    mc.add_argument("--max-events-per-hour", type=int, default=60)
+    mc.add_argument("--max-events-per-day", type=int, default=500)
+    mc.add_argument("--max-publish-gib", type=float, default=50.0, help="the most one publication may hold")
+    mc.add_argument("--valid-hours", type=float, help="the agent key signs nothing after this many hours from now")
 
     sub.add_parser("keygen", help="make a signing key pair and print it (nothing is saved)")
 
@@ -162,7 +171,22 @@ def main(argv: list[str] | None = None) -> None:
 
         logging.getLogger("httpx").setLevel(logging.WARNING)  # stderr is read by MCP clients, keep it quiet
 
-        build_server(args.gateway, Path(args.download_root), int(args.max_gib * 1024**3), signer=args.signer).run("stdio")
+        actor = None
+        if args.agent_key_file:
+            import sys
+            import time
+
+            from .agent_actions import Actor
+            from .signing import key_file_warning, parse_secret
+
+            if (w := key_file_warning(args.agent_key_file)):
+                print(f"warning: {w}", file=sys.stderr)
+            actor = Actor(parse_secret(Path(args.agent_key_file).read_text()), Path(args.audit_log), allow_repos=tuple(args.allow_repo),
+                          max_per_hour=args.max_events_per_hour, max_per_day=args.max_events_per_day,
+                          not_after=time.time() + args.valid_hours * 3600 if args.valid_hours else None,
+                          max_publish_bytes=int(args.max_publish_gib * 1024**3))
+        build_server(args.gateway, Path(args.download_root), int(args.max_gib * 1024**3), signer=args.signer, actor=actor,
+                     work_root=Path(args.work_root), hub=args.hub).run("stdio")
     elif args.cmd == "keygen":
         import os
 

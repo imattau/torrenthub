@@ -302,6 +302,17 @@ class Store:
         with self._lock, self._db:
             self._db.execute("INSERT OR IGNORE INTO published VALUES (?,?,?)", (repo_id, signer, time.time()))
 
+    def list_repos(self, query: str = "", limit: int = 50) -> list[dict]:
+        """Repos this hub knows a branch of, newest first. `query` is a plain substring of the name."""
+        like = "%" + query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT r.repo_id AS repo_id, COUNT(*) AS refs, MAX(r.fetched_at) AS at, p.signer AS signer "
+                "FROM refs r LEFT JOIN published p ON p.repo_id = r.repo_id "
+                "WHERE r.repo_id LIKE ? ESCAPE '\\' GROUP BY r.repo_id ORDER BY at DESC LIMIT ?",
+                (like, max(1, min(int(limit), 500)))).fetchall()
+        return [{"repo": r["repo_id"], "branches": r["refs"], "updated_at": r["at"], "published_by": r["signer"]} for r in rows]
+
     def is_published(self, repo_id: str) -> bool:
         with self._lock:
             return self._db.execute("SELECT 1 FROM published WHERE repo_id=?", (repo_id,)).fetchone() is not None

@@ -35,7 +35,7 @@ def server_for(gateway, tmp_path, **kw):
 
 def test_lists_the_tools(gateway, tmp_path):
     names = run(server_for(gateway, tmp_path), lambda c: _names(c))
-    assert set(names) == {"repo_info", "check_trust", "fetch_file", "verify_file", "get_verdict", "gateway_status"}
+    assert {"repo_info", "check_trust", "fetch_file", "verify_file", "get_verdict", "gateway_status"} <= set(names)
 
 
 async def _names(c):

@@ -519,6 +519,12 @@ def create_app(
     async def model_info(repo_id: str):
         return await _model_info(repo_id, "main")
 
+    @app.get("/api/thub/repos")
+    async def list_repos(q: str = "", limit: int = 50):
+        """Repos this hub holds a branch of. `published_by` is the key that published it here, or null
+        for a repo mirrored from an upstream. Names are the publishers' words, so they are data."""
+        return JSONResponse({"repos": store.list_repos(q[:100], limit)}, headers={"X-Mirror": "torrenthub"})
+
     # ------------------------------------------------------------ participant events
 
     @app.post("/api/thub/events")
