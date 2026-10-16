@@ -37,7 +37,7 @@ from pathlib import Path
 
 from . import gitrepo
 from .config import Settings
-from .manifest import build_git_manifest, table_bytes
+from .manifest import MAX_HISTORY_BYTES, build_git_manifest, table_bytes
 from .publish import Manifest_seq, Manifest_version, info_from_rows
 from .store import BlobRow, FileRec, Store
 from .torrent import PieceHasher, bdecode, build_torrent, choose_piece_length, infohash_from_torrent, sanitize_torrent
@@ -72,6 +72,7 @@ class Host:
     status: dict = field(default_factory=dict)
     _derived: dict = field(default_factory=dict)  # commit -> Derived, so an idle pass reads no git objects
     _where: dict = field(default_factory=dict)  # oid -> a path in the tree that names it (for finding the file)
+    _history: dict = field(default_factory=dict)  # commit -> the history pack entry in its manifest
 
     def __post_init__(self):
         self.git_dir = Path(self.git_dir)
@@ -124,10 +125,11 @@ class Host:
             self._derived[head] = d
         await self._ensure_files(d)
         await asyncio.to_thread(self._mirror_git, head, names)
+        history = await self._history_entry(head)
         todo = [b for b in names if cur[b] is None or cur[b]["commit"] != head or due[b]]
         results = []
         if todo:
-            seq = await asyncio.to_thread(self._sign_and_store, head, d, todo)
+            seq = await asyncio.to_thread(self._sign_and_store, head, d, todo, history)
             for b in todo:
                 self.status[b].commit, self.status[b].seq = head, seq
                 results.append({"branch": b, "action": "signed", "commit": head, "seq": seq})
@@ -169,7 +171,7 @@ class Host:
                 top = max(top, seq)
         return top + 1
 
-    def _sign_and_store(self, head: str, d: gitrepo.Derived, branches: list[str]) -> int:
+    def _sign_and_store(self, head: str, d: gitrepo.Derived, branches: list[str], history: dict | None = None) -> int:
         """Sign one manifest for `branches` (all at `head`) and make the commit visible. Blocking."""
         for ev in self.store.list_manifests(self.repo):
             if Manifest_version(ev) != 3:
@@ -179,7 +181,7 @@ class Host:
         seq = self._next_seq(branches)
         ts = int(time.time())
         ev = build_git_manifest(self.secret, self.repo, head, d.tree, d.parents, d.rows, sorted(branches), created_at=ts, seq=seq,
-                                valid_until=int(ts + self.valid_for) if self.valid_for else None, force=rewritten)
+                                valid_until=int(ts + self.valid_for) if self.valid_for else None, force=rewritten, history=history)
         files_x = next((t[1] for t in ev["tags"] if t[0] == "files_x"), None)
         if files_x:
             self.store.put_small(files_x, table_bytes(d.rows))
@@ -217,6 +219,33 @@ class Host:
                 shutil.rmtree(tmp, ignore_errors=True)
         for b in branches:
             gitrepo.update_ref(perm, b, head)
+
+    async def _history_entry(self, head: str) -> dict | None:
+        """The commit's whole history as a pack, kept as a blob with a torrent and seeded, so a clone fetches it
+        over BitTorrent. Built once per commit; the manifest signs its sha256, size and infohash."""
+        entry = self._history.get(head)
+        if entry and self.store.blob_complete(entry["x"]) and self.store.torrent_path(entry["x"]).exists():
+            return entry
+        entry = await asyncio.to_thread(self._build_history, head)
+        await self.swarm.seed(self.store.torrent_path(entry["x"]), self.store.blob_path(entry["x"]).parent)
+        self._history[head] = entry
+        return entry
+
+    def _build_history(self, head: str) -> dict:
+        s = self.settings
+        pack = gitrepo.make_pack(self.git_dir, head, [], fsize=MAX_HISTORY_BYTES * 2)
+        if len(pack) > min(MAX_HISTORY_BYTES, s.publish_git_history_max):
+            raise HostError(f"the history of {head[:12]} is {len(pack):,} bytes as a pack, over the limit; large files belong in LFS pointers, not in git")
+        x = hashlib.sha256(pack).hexdigest()
+        ph = PieceHasher(choose_piece_length(len(pack)))
+        ph.update(pack)
+        raw, ih = build_torrent(name=x, length=len(pack), piece_length=choose_piece_length(len(pack)), pieces=ph.finish(), trackers=[], comment="torrenthub git history")
+        path, tmp = self.store.blob_path(x), self.store.tmp_path(x)
+        tmp.write_bytes(pack)
+        tmp.replace(path)
+        self.store.torrent_path(x).write_bytes(sanitize_torrent(raw, s.trackers, [f"{s.public_url}/blobs/{x}"]))
+        self.store.put_blob(BlobRow(x, len(pack), x, "complete", ih, choose_piece_length(len(pack)), time.time()))
+        return {"x": x, "size": len(pack), "i": ih}
 
     # ------------------------------------------------------------------ big files, in place
     async def _ensure_files(self, d: gitrepo.Derived) -> None:

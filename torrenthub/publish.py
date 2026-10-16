@@ -381,6 +381,24 @@ class Ingest:
             new_bytes += len(table)
         if work is not None:
             new_bytes += work.pack_size
+        hist = (m.git or {}).get("history") if work is not None else None
+        if hist:
+            hx, hsize = hist["x"], hist["size"]
+            if hsize > self.s.publish_git_history_max:
+                raise PublishError(413, "TooLarge", f"the history pack is {hsize:,} bytes; this hub takes {self.s.publish_git_history_max:,} at most")
+            if not self.store.blob_complete(hx):
+                if hx not in torrents:
+                    raise PublishError(400, "MissingContent", "the manifest names a history pack: send its torrent")
+                if not self.swarm.enabled:
+                    raise PublishError(400, "NoSwarm", "the history pack needs a swarm transfer and this hub has no swarm")
+                try:
+                    validate_torrent(torrents[hx], hx, hsize)
+                    if infohash_from_torrent(torrents[hx]) != hist["i"]:
+                        raise TorrentRejected("the torrent is not the one the manifest names")
+                    need_swarm[hx] = (sanitize_torrent(torrents[hx]), hsize)
+                except TorrentRejected as e:
+                    raise PublishError(400, "BadTorrent", f"history pack: {e}") from e
+                new_bytes += hsize
 
         reserved = sum(j.reserved for j in self.jobs.values() if j.signer == m.pubkey and j.state == "pulling")
         used = self.store.charged_bytes(m.pubkey)
@@ -400,7 +418,7 @@ class Ingest:
             job.files[x]["state"] = "stored"
             job.files[x]["bytes"] = len(data)
         for x, (tbytes, size) in need_swarm.items():
-            job.files[x]["state"] = "pulling"
+            job.files.setdefault(x, {"path": "(git history)", "size": size, "state": "waiting", "bytes": 0})["state"] = "pulling"
         if table is not None and m.files_x and not self.store.blob_complete(m.files_x):
             self._put_small(m.files_x, table)
         task = asyncio.create_task(self._run(job, m, table, need_swarm, have_inline, work))
@@ -417,6 +435,8 @@ class Ingest:
     async def _run(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict, work: GitWork | None = None) -> None:
         try:
             await asyncio.wait_for(self._pull(job, need), timeout=self.s.publish_timeout)
+            if work is not None and (m.git or {}).get("history"):
+                await asyncio.to_thread(self._check_history, m)
             if work is not None:
                 async with self._lock(m.repo):
                     await asyncio.to_thread(self._git_finish, m, work)
@@ -438,6 +458,19 @@ class Ingest:
                 shutil.rmtree(work.tmp, ignore_errors=True)
             job.reserved = 0
             job.finished = time.time()
+
+    def _check_history(self, m: Manifest) -> None:
+        """The history pack the manifest names must be exactly the history of its commit."""
+        s, hx = self.s, m.git["history"]["x"]
+        try:
+            pack = self.store.blob_path(hx).read_bytes()
+            gitrepo.check_history_pack(pack, m.commit, max_objects=s.publish_git_max_objects, timeout=s.publish_git_timeout,
+                                       work_dir=self.store.root / "tmp")
+        except (gitrepo.GitError, OSError) as e:
+            self.store.set_blob_state(hx, "missing")
+            self.store.blob_path(hx).unlink(missing_ok=True)
+            self.store.torrent_path(hx).unlink(missing_ok=True)
+            raise PublishError(400, "BadGit", f"history pack: {e}") from None
 
     def _fail(self, job: Job, need: dict, why: str) -> None:
         job.state, job.error = "failed", why
@@ -501,6 +534,8 @@ class Ingest:
             self.store.charge(m.pubkey, m.files_x, len(table))
         if work is not None:
             self.store.charge(m.pubkey, f"git-{work.pack_sha}", work.pack_size)
+            if (m.git or {}).get("history"):
+                self.store.charge(m.pubkey, m.git["history"]["x"], m.git["history"]["size"])
         info = info_from_rows(m.repo, m.commit, m.rows)
         files = [FileRec(p, size, x, x, True) for p, size, x, _ in m.rows]
         self.store.mark_published(m.repo, m.pubkey)

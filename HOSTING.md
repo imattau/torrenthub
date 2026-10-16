@@ -1,6 +1,6 @@
 # Hosting your own repository, backed by git
 
-Status: **all four stages are built** (`PROTOCOL.md` sections 18 to 21 say exactly what, how they were measured, and what is not done). H4 is still design only. Written 2026-10-16 after reading `publish.py`, `manifest.py` and `mirror.py`. Where the design below and section 18 differ, section 18 is what the code does.
+Status: **all four stages are built, and H5 puts the bytes back in the swarm** (`PROTOCOL.md` sections 18 to 22 say exactly what, how they were measured, and what is not done). H4 is still design only. Written 2026-10-16 after reading `publish.py`, `manifest.py` and `mirror.py`. Where the design below and section 18 differ, section 18 is what the code does.
 
 ## What exists, and what is missing
 

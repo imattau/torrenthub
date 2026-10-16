@@ -112,23 +112,29 @@ def smudge(inp, out, gd: Path, hubs: list[str]) -> None:
             out.write(chunk)
 
 
-def ensure_cached(gd: Path, oid: str, size: int, hubs: list[str]) -> Path:
+def ensure_cached(gd: Path, oid: str, size: int, hubs: list[str], cfg=None) -> Path:
+    """The file for a pointer, from the cache or fetched: over BitTorrent first (clientswarm.py), then HTTP."""
+    from . import clientswarm
+
     dest = cache_path(gd, oid)
     if dest.is_file() and dest.stat().st_size == size:
         return dest
+    cfg = cfg or clientswarm.config_from_env(gd)
     errors = []
     for hub in hubs:
         try:
-            download(hub, oid, size, dest, gd)
+            clientswarm.fetch_blob(hub, oid, size, dest, Path(gd) / "thub" / "swarm", cfg=cfg, keep_torrent=Path(gd) / "thub" / "torrents" / f"{oid}.torrent")
             return dest
-        except (httpx.HTTPError, ValueError) as e:
-            errors.append(f"{hub}: {e}")
+        except GitError as e:
+            errors.append(str(e))
     raise GitError(f"cannot get {oid[:12]} ({size:,} bytes): " + ("; ".join(errors) or "no hub is configured (set thub.hub, or add a thub remote)"))
 
 
-def download(hub: str, oid: str, size: int, dest: Path, gd: Path) -> None:
-    """GET the blob and keep it only if it is the file the pointer names."""
-    tmp = _tmp(gd)
+def download(hub: str, oid: str, size: int, dest: Path, tmp_dir: Path) -> None:
+    """GET the blob over HTTP and keep it only if it is the file the pointer names."""
+    tmp_dir = Path(tmp_dir)
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp = tmp_dir / uuid.uuid4().hex
     h, got = hashlib.sha256(), 0
     try:
         with httpx.stream("GET", f"{hub.rstrip('/')}/blobs/{oid}", timeout=60, follow_redirects=True) as r:

@@ -9,6 +9,7 @@ import json
 import os
 import shutil
 import subprocess
+import time
 
 import httpx
 import pytest
@@ -96,6 +97,15 @@ def raw_body(root, rows=None, *, seq=1, refs=("main",), rev="HEAD", have=(), for
     return {"manifest": ev, "inline": {}, "torrents": {}, "git": {"head": head, "pack": base64.b64encode(pack).decode()}}
 
 
+def history_of(pub) -> dict:
+    return json.loads(pub.manifest["content"])["git"]["history"]
+
+
+def big_torrents(pub) -> set:
+    """The torrents of a publication that are for files of the repo, not for its history pack."""
+    return set(pub.torrents) - {history_of(pub)["x"]}
+
+
 def send(hub, body):
     r = httpx.post(f"{hub.url}/api/thub/publish", json=body, timeout=60)
     return r.status_code, r.headers.get("x-error-code"), (r.json().get("error", "") if r.status_code >= 400 else r.json())
@@ -128,7 +138,7 @@ def test_a_second_commit_sends_only_what_the_hub_lacks_and_moves_the_branch(hub,
     first, _ = run(gpush(hub, root, tmp_path / "s1"))
     head2 = commit(root, {"README.md": b"# version two\n", "notes/new.txt": b"hello\n"}, message="second")
     pub2, st = run(gpush(hub, root, tmp_path / "s2", seq=2))
-    assert st["state"] == "done" and pub2.commit == head2 and not pub2.torrents, "the big file is already on the hub"
+    assert st["state"] == "done" and pub2.commit == head2 and not big_torrents(pub2), "the big file is already on the hub"
     full = G.make_pack(root, head2, [])
     assert len(base64.b64decode(pub2.body["git"]["pack"])) < len(full), "only the new objects were sent"
     perm = hub.app.state.ingest._perm_repo(REPO)
@@ -150,7 +160,7 @@ def test_a_new_big_file_in_a_later_commit_goes_by_torrent(hub, tmp_path):
     other = os.urandom(1_500_000)
     commit(root, big={"extra.bin": other})
     pub, st = run(gpush(hub, root, tmp_path / "s2", seq=2))
-    assert st["state"] == "done" and list(pub.torrents) == [hashlib.sha256(other).hexdigest()]
+    assert st["state"] == "done" and big_torrents(pub) == {hashlib.sha256(other).hexdigest()}
     assert httpx.get(f"{hub.url}/{REPO}/resolve/main/extra.bin", timeout=60).content == other
 
 
@@ -166,17 +176,14 @@ def test_the_pack_counts_against_the_quota(tmp_path):
         assert code[0] == 413 and code[1] == "QuotaExceeded"
     finally:
         h.stop()
-    h2 = Hub(tmp_path, "hub2", quota=len(data) + pack)
+    hist = history_of(pub)["size"]
+    h2 = Hub(tmp_path, "hub2", quota=len(data) + pack + hist)
+    sw = publisher_swarm()
     try:
-        assert send(h2, pub.body)[0] == 202
-        import time
-
-        for _ in range(50):
-            if h2.store.charged_bytes(PK):
-                break
-            time.sleep(0.1)
-        assert h2.store.charged_bytes(PK) == len(data) + pack, "the file and the pack are both charged"
+        run(publish(h2.url, pub, sw, timeout=60, poll=0.3))
+        assert h2.store.charged_bytes(PK) == len(data) + pack + hist, "the file, the pack sent with the request and the history pack are all charged"
     finally:
+        run(sw.close())
         h2.stop()
 
 
@@ -220,11 +227,19 @@ def test_two_publications_racing_on_one_branch_cannot_both_win(hub, tmp_path):
     b = commit(root, {"b.txt": b"b\n"}, message="b")
     pa = prepare_git(SK, REPO, root, tmp_path / "sa", rev=a, seq=2, have=[base])
     pb = prepare_git(SK, REPO, root, tmp_path / "sb", rev=b, seq=3, have=[base])
-    ra, rb = send(hub, pa.body), send(hub, pb.body)
-    assert ra[0] == 202 and rb[0] in (202, 409)
-    import time
+    async def both():
+        import asyncio
 
-    time.sleep(2)  # let any job still running finish
+        sa, sb = publisher_swarm(), publisher_swarm()
+        try:
+            return await asyncio.gather(publish(hub.url, pa, sa, timeout=60, poll=0.3), publish(hub.url, pb, sb, timeout=60, poll=0.3),
+                                        return_exceptions=True)
+        finally:
+            await sa.close()
+            await sb.close()
+
+    ra, rb = run(both())
+    assert not isinstance(ra, Exception) or not isinstance(rb, Exception), "at least one of them gets in"
     top = httpx.get(f"{hub.url}/api/thub/git/{REPO}/refs", timeout=30).json()["refs"]["main"]
     perm = hub.app.state.ingest._perm_repo(REPO)
     assert git(perm, "rev-parse", "refs/heads/main") == top and top in (a, b)
@@ -462,7 +477,7 @@ def test_the_publisher_finds_a_big_file_in_the_git_lfs_cache(tmp_path):
     cache = root / ".git" / "lfs" / "objects" / oid[:2] / oid[2:4]
     cache.mkdir(parents=True)
     (cache / oid).write_bytes(BIG)
-    assert list(prepare_git(SK, REPO, root, tmp_path / "s").torrents) == [oid]
+    assert big_torrents(prepare_git(SK, REPO, root, tmp_path / "s")) == {oid}
 
 
 def test_the_working_tree_is_not_published_only_the_commit(hub, tmp_path):
@@ -515,3 +530,105 @@ def test_manifest_v3_round_trips_and_notices_tampering():
     del body["git"]
     with pytest.raises(ManifestInvalid, match="git field"):
         verify_manifest(sg.sign_event(SK, ev["kind"], ev["tags"], json.dumps(body, separators=(",", ":"), sort_keys=True), ev["created_at"]), {PK}, REPO)
+
+
+# ------------------------------------------------------------------ the history pack, shared over BitTorrent
+
+def test_the_hub_holds_the_history_pack_as_a_blob_with_the_torrent_the_manifest_names(hub, tmp_path):
+    from torrenthub.torrent import infohash_from_torrent
+
+    root = make_repo(tmp_path, files=FILES, big={"weights.bin": BIG})
+    pub, st = run(gpush(hub, root, tmp_path / "s1"))
+    h = history_of(pub)
+    assert st["state"] == "done" and hub.store.blob_complete(h["x"])
+    assert infohash_from_torrent(hub.store.torrent_path(h["x"]).read_bytes()) == h["i"], "the torrent is the one the signed manifest names"
+    assert hub.store.get_blob(h["x"]).infohash == h["i"] and hub.store.charged_bytes(PK) >= h["size"]
+    pack = hub.store.blob_path(h["x"]).read_bytes()
+    assert hashlib.sha256(pack).hexdigest() == h["x"] and len(pack) == h["size"]
+    G.check_history_pack(pack, pub.commit, max_objects=1000)  # the pack is the whole history of the commit and nothing else
+
+
+def _with_history(monkeypatch, pack_for):
+    from torrenthub import publisher
+
+    real = publisher.history_from_pack
+    monkeypatch.setattr(publisher, "make_history", lambda git_dir, head, stage, trackers=None: real(pack_for(git_dir, head), head, stage, trackers))
+
+
+def test_a_history_pack_with_objects_the_commit_does_not_reach_is_refused(hub, tmp_path, monkeypatch):
+    root = make_repo(tmp_path, files=FILES)
+    git(root, "checkout", "-q", "-b", "other")
+    (root / "unrelated.txt").write_bytes(os.urandom(2000))
+    git(root, "add", "unrelated.txt")
+    git(root, "commit", "-q", "-m", "unrelated")
+    git(root, "checkout", "-q", "main")
+    # a pack of main's history plus another branch's commit: more than the history of the commit it is named for
+    _with_history(monkeypatch, lambda d, head: G.run_git(["-C", str(d), "pack-objects", "--revs", "--stdout", "--quiet"], stdin=f"{head}\nother\n".encode())[1])
+    with pytest.raises(RuntimeError, match="exactly the history"):
+        run(gpush(hub, root, tmp_path / "s"))
+    assert not hub.store.is_published(REPO)
+
+
+def test_a_history_pack_missing_part_of_the_history_is_refused(hub, tmp_path, monkeypatch):
+    root = make_repo(tmp_path, files=FILES)
+    commit(root, {"more.txt": b"m\n"}, message="child")
+    first = git(root, "rev-parse", "HEAD~1")
+    _with_history(monkeypatch, lambda d, head: G.make_pack(d, head, [first]))  # only the newest commit
+    with pytest.raises(RuntimeError, match="history pack"):
+        run(gpush(hub, root, tmp_path / "s"))
+
+
+def test_garbage_named_as_a_history_pack_is_refused(hub, tmp_path, monkeypatch):
+    root = make_repo(tmp_path, files=FILES)
+    _with_history(monkeypatch, lambda d, head: b"PACK" + os.urandom(300))
+    with pytest.raises(RuntimeError, match="history pack"):
+        run(gpush(hub, root, tmp_path / "s"))
+    assert not hub.store.is_published(REPO)
+
+
+def test_the_torrent_must_be_the_one_the_manifest_names(hub, tmp_path):
+    root = make_repo(tmp_path, files=FILES)
+    pub = prepare_git(SK, REPO, root, tmp_path / "s")
+    h = history_of(pub)
+    from torrenthub.torrent import bdecode, bencode
+
+    meta = bdecode(base64.b64decode(pub.body["torrents"][h["x"]]))
+    meta[b"info"][b"pieces"] = bytes(len(meta[b"info"][b"pieces"]))  # same name and length, different pieces: another infohash
+    pub.body["torrents"][h["x"]] = base64.b64encode(bencode(meta)).decode()
+    code, err, msg = send(hub, pub.body)
+    assert (code, err) == (400, "BadTorrent") and "manifest names" in msg
+
+
+def test_no_torrent_for_the_named_history_pack_is_refused(hub, tmp_path):
+    root = make_repo(tmp_path, files=FILES)
+    pub = prepare_git(SK, REPO, root, tmp_path / "s")
+    del pub.body["torrents"][history_of(pub)["x"]]
+    assert send(hub, pub.body)[:2] == (400, "MissingContent")
+
+
+def test_a_history_over_the_hubs_limit_is_refused(tmp_path):
+    h = Hub(tmp_path, publish_git_history_max=100)
+    try:
+        root = make_repo(tmp_path, files=FILES)
+        assert send(h, prepare_git(SK, REPO, root, tmp_path / "s").body)[:2] == (413, "TooLarge")
+    finally:
+        h.stop()
+
+
+def test_a_manifest_with_a_malformed_history_field_is_invalid():
+    from torrenthub.manifest import ManifestInvalid, build_git_manifest, verify_manifest
+
+    rows = (("a", 1, "11" * 32, None),)
+    good = {"x": "22" * 32, "size": 5, "i": "33" * 20}
+    ev = build_git_manifest(SK, REPO, "aa" * 20, "bb" * 20, [], rows, ["main"], seq=1, history=good)
+    assert verify_manifest(ev, {PK}, REPO).git["history"] == good
+    for bad in ({**good, "size": 0}, {**good, "x": "zz"}, {**good, "i": "33" * 32}, {"x": good["x"], "size": 5}, {**good, "extra": 1}):
+        with pytest.raises(ValueError):
+            build_git_manifest(SK, REPO, "aa" * 20, "bb" * 20, [], rows, ["main"], seq=1, history=bad)
+    body = json.loads(ev["content"])
+    body["git"]["history"]["size"] = -5
+    from torrenthub import signing as sgn
+
+    forged = sgn.sign_event(SK, ev["kind"], ev["tags"], json.dumps(body, separators=(",", ":"), sort_keys=True), ev["created_at"])
+    with pytest.raises(ManifestInvalid, match="git field"):
+        verify_manifest(forged, {PK}, REPO)

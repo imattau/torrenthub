@@ -580,6 +580,12 @@ def create_app(
             raise HubError(e.status, e.code, e.message) from None
         return JSONResponse(out, status_code=200 if out.get("already") else 202)
 
+    @app.get("/api/thub/info")
+    async def hub_info():
+        """What a client needs to join this hub's swarm directly, besides trackers and DHT."""
+        return {"swarm": {"enabled": bool(swarm.enabled), "port": settings.listen_port if swarm.enabled else None},
+                "public_url": settings.public_url, "trackers": list(settings.trackers)}
+
     @app.get("/api/thub/git/{owner}/{name}/refs")
     async def git_refs(owner: str, name: str):
         """Where each branch of a git backed published repo is. A publisher asks before it makes a

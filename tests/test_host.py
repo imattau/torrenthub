@@ -95,6 +95,8 @@ def test_a_repo_in_a_git_directory_is_served_signed_and_verified(node, made, tmp
     for name, data in {**FILES, "weights.bin": BIG}.items():
         assert open(f"{local}/{name}", "rb").read() == data, name
     m = verify_manifest(manifests(node)[0], {PK}, REPO)
+    h = m.git["history"]
+    assert node.store.blob_complete(h["x"]) and node.store.get_blob(h["x"]).infohash == h["i"], "the history pack is a blob with the torrent the manifest names"
     assert m.commit == head and m.git["tree"] == git(made, "rev-parse", "HEAD^{tree}") and m.git["force"] is False and m.seq == 1
 
 

@@ -27,6 +27,7 @@ but protocol to stdout.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
@@ -215,9 +216,12 @@ class Helper:
             if not gitrepo.run_git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=self.git_dir, ok=(0, 1, 128))[0] == 0:
                 missing.append(sha)
         haves = [h for h in _git(["for-each-ref", "--format=%(objectname)"], cwd=self.git_dir).split() if gitrepo.SHA40.fullmatch(h)][:64]
+        by_sha = {sha: signed[name.removeprefix("refs/heads/")][1] for sha, name in wants}
         for sha in dict.fromkeys(missing):
             if self.verbosity:
                 self.log(f"fetching {sha[:12]}")
+            if self.history_from_swarm(sha, by_sha[sha]):
+                continue
             r = httpx.post(f"{self.hub}/api/thub/git/{self.repo}/pack", json={"want": sha, "have": haves}, timeout=600)
             if r.status_code != 200:
                 raise RemoteError(f"the hub would not send {sha[:12]} ({r.status_code} {r.headers.get('x-error-code', '')})")
@@ -227,6 +231,31 @@ class Helper:
             d = gitrepo.derive(self.git_dir, sha, blob_max=64 << 20, small_total=256 << 20, max_files=100_000, sandbox=True)
             if d.rows != tuple(m.rows) or d.tree != m.git["tree"]:
                 raise RemoteError(f"{name}: the commit the hub sent does not give the file table the manifest signs; refusing it")
+
+    def history_from_swarm(self, sha: str, m) -> bool:
+        """The commit's whole history as one pack, over BitTorrent (its sha256 and infohash are in the signed
+        manifest). False means the manifest names none, or it could not be had or used: the caller asks the
+        hub's pack endpoint instead. Whatever comes is checked before it is believed: the sha256 of the pack,
+        then git's own check of every object, then the usual comparison with the manifest's file table."""
+        from . import clientswarm
+
+        hist = (m.git or {}).get("history")
+        if not hist:
+            return False
+        gd = self.git_dir
+        dest = gd / "thub" / "packs" / hist["x"]
+        try:
+            if not dest.is_file() or dest.stat().st_size != hist["size"]:
+                got = clientswarm.fetch_blob(self.hub, hist["x"], hist["size"], dest, gd / "thub" / "swarm", infohash=hist["i"],
+                                             cfg=clientswarm.config_from_env(gd), keep_torrent=gd / "thub" / "torrents" / f"{hist['x']}.torrent", say=self.log)
+                self.log(f"history of {sha[:12]}: {hist['size']:,} bytes, from the {'swarm' if got['via'] == 'swarm' else 'hub over HTTP'}")
+            gitrepo.run_git(["index-pack", "--stdin", "--fix-thin", "--strict"], cwd=gd, stdin=dest.read_bytes(), timeout=600.0, fsize=1 << 33)
+            if gitrepo.run_git(["cat-file", "-e", f"{sha}^{{commit}}"], cwd=gd, ok=(0, 1, 128))[0] != 0:
+                raise gitrepo.GitError("the history pack does not hold the commit")
+            return True
+        except (gitrepo.GitError, OSError) as e:
+            self.log(f"the history pack could not be used ({e}); asking the hub's pack endpoint")
+            return False
 
     # ------------------------------------------------------------------ push
     def secret(self) -> bytes:
@@ -271,7 +300,8 @@ class Helper:
                 from .swarm import LibtorrentSwarm
 
                 swarm = LibtorrentSwarm(0, dht=False)
-            self.log(f"publishing {pub.commit[:12]} as seq {seq}: {len(pub.torrents)} big file(s) by torrent")
+            hist = len(pub.torrents) - (1 if (pub.manifest and "history" in json.loads(pub.manifest["content"])["git"]) else 0)
+            self.log(f"publishing {pub.commit[:12]} as seq {seq}: {hist} big file(s) and the history by torrent")
             try:
                 await publish(self.hub, pub, swarm, timeout=3600.0)
             finally:

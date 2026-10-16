@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "filter", "git-init", "pull-files", "verify-git", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "filter", "git-init", "pull-files", "verify-git", "seed", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -102,6 +102,12 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--dir", default=".")
     sp.add_argument("--signer", action="append", default=[], help="the owner's public key (hex or npub), repeatable; also thub.signer and THUB_SIGNERS")
     sp.add_argument("--hub", help="URL of the repo on the hub (default: remote.origin.url)")
+
+    sp = sub.add_parser("seed", help="share what this clone has fetched (big files and history packs) with other clones over BitTorrent")
+    sp.add_argument("--dir", default=".")
+    sp.add_argument("--listen-port", type=int, default=6881)
+    sp.add_argument("--seconds", type=float, help="stop after this long (default: until interrupted)")
+    sp.add_argument("--once", action="store_true", help="start seeding, report, and exit (for scripts and tests)")
 
     sp = sub.add_parser("pull-files", help="replace the pointer files in this working tree by the files they name, fetched from the hub of a thub remote")
     sp.add_argument("--dir", default=".")
@@ -449,6 +455,37 @@ def run_event_command(args, settings, p) -> None:
             print(json.dumps(res, indent=1))
             if not res["ok"]:
                 raise SystemExit(1)
+        elif c == "seed":
+            import asyncio
+
+            from . import clientswarm, pointers
+            from .swarm import LibtorrentSwarm
+
+            gd = pointers.git_dir(Path(args.dir))
+            items = []
+            for tp in sorted((gd / "thub" / "torrents").glob("*.torrent")):
+                for sub_dir in ("objects", "packs"):
+                    f = gd / "thub" / sub_dir / tp.stem
+                    if f.is_file():
+                        items.append((tp, f))
+            cfg = clientswarm.config_from_env(gd)
+
+            async def go():
+                sw = LibtorrentSwarm(args.listen_port, dht=cfg.dht)
+                try:
+                    for tp, f in items:
+                        await sw.seed(tp, f.parent)
+                    print(json.dumps({"seeding": len(items), "port": args.listen_port or sw.ses.listen_port(), "files": [f.name for _, f in items]}), flush=True)
+                    if args.once:
+                        return
+                    await asyncio.sleep(args.seconds) if args.seconds else await asyncio.Event().wait()
+                finally:
+                    await sw.close()
+
+            try:
+                asyncio.run(go())
+            except KeyboardInterrupt:
+                pass
         elif c == "pull-files":
             from . import pointers
 

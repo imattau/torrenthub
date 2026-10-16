@@ -343,6 +343,32 @@ def make_pack(repo: Path, head: str, have: list[str], *, fsize: int = 1 << 31, t
     return out
 
 
+def pack_object_count(repo: Path, pack_sha: str) -> int:
+    """How many objects an indexed pack holds."""
+    idx = Path(repo) / "objects" / "pack" / f"pack-{pack_sha}.idx"
+    _, out, _ = run_git(["show-index"], stdin=idx.read_bytes(), sandbox=True, fsize=1 << 30)
+    return out.count(b"\n")
+
+
+def check_history_pack(pack: bytes, head: str, *, max_objects: int, timeout: float = 60.0, work_dir: Path | None = None) -> None:
+    """A history pack must be a whole, self-contained history of `head` and nothing more: it is
+    indexed in a repository of its own (no borrowed objects), the commit must be in it with
+    everything reachable present, and it must hold exactly the objects reachable from the commit,
+    so a hub is not made to host unrelated data under a signed name."""
+    tmp = Path(tempfile.mkdtemp(prefix="history-", dir=work_dir))
+    try:
+        init_bare(tmp)
+        sha = index_pack(tmp, pack, max_pack=len(pack) + 1, timeout=timeout)
+        if object_type(tmp, head) != "commit":
+            raise GitError("the history pack does not contain the commit")
+        n = check_connected(tmp, head, max_objects=max_objects, timeout=timeout)
+        have = pack_object_count(tmp, sha)
+        if have != n:
+            raise GitError(f"the history pack holds {have:,} objects and the commit's history has {n:,}: it must hold exactly the history")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def find_big_file(repo: Path, rel: str, oid: str, size: int, extra: list[Path], worktree: bool = True) -> Path | None:
     """Where the bytes for a pointer are on the publisher's disk: the working tree, git-lfs's
     cache, or a folder given by the user. The caller still hashes what it finds."""

@@ -22,7 +22,7 @@ if shutil.which("git") is None:
 from tests.conftest import Server, free_port  # noqa: E402
 from tests.test_git_publish import BIG, FILES, GIT_ENV  # noqa: E402
 from tests.test_host import Node  # noqa: E402
-from tests.test_publish import PK, REPO, SK, Hub  # noqa: E402
+from tests.test_publish import PK, REPO, SK, Hub, run  # noqa: E402
 from torrenthub import gitrepo as G  # noqa: E402
 from torrenthub import pointers  # noqa: E402
 from torrenthub import signing as sg  # noqa: E402
@@ -44,7 +44,8 @@ def env(tmp_path):
         f.chmod(f.stat().st_mode | stat.S_IEXEC)
     key = tmp_path / "key"
     key.write_text(SK.hex())
-    return {**GIT_ENV, "PATH": f"{shims}:{os.environ['PATH']}", "THUB_KEY_FILE": str(key), "THUB_DATA": str(tmp_path / "thub-data"), "PYTHONPATH": str(ROOT)}
+    return {**GIT_ENV, "PATH": f"{shims}:{os.environ['PATH']}", "THUB_KEY_FILE": str(key), "THUB_DATA": str(tmp_path / "thub-data"), "PYTHONPATH": str(ROOT),
+            "THUB_CLIENT_DHT": "0", "THUB_CLIENT_STALL": "3"}
 
 
 def g(env, cwd, *args, check=True, input=None):
@@ -162,7 +163,7 @@ def test_a_second_push_sends_only_new_objects_and_a_fast_forward_is_accepted(hub
     (root / "README.md").write_bytes(b"# two\n")
     g(env, root, "commit", "-q", "-am", "two")
     r = g(env, root, "push", "hub", "main")
-    assert "0 big file(s)" in r.stderr
+    assert "0 big file(s) and the history by torrent" in r.stderr
     assert httpx.get(f"{hub.url}/{REPO}/resolve/main/README.md", timeout=10).content == b"# two\n"
     assert httpx.get(f"{hub.url}/api/thub/git/{REPO}/refs", timeout=10).json()["refs"]["main"] == head(env, root)
 
@@ -310,6 +311,7 @@ def test_a_hub_that_sends_the_wrong_objects_is_caught(hub, env, tmp_path, monkey
     g(env, src, "push", "hub", "main")
     ing = hub.app.state.ingest
     older = head(env, src, "HEAD~1")
+    remove_history(hub, src, env)  # a clone then has to ask the pack endpoint
     real = ing.serve_pack
 
     async def liar(repo, want, have, host_dir=None):
@@ -321,6 +323,17 @@ def test_a_hub_that_sends_the_wrong_objects_is_caught(hub, env, tmp_path, monkey
     assert r.returncode != 0
     refs = subprocess.run(["git", "-C", str(dst), "for-each-ref"], capture_output=True, text=True, env=env).stdout if dst.exists() else ""
     assert refs.strip() == "", "no branch was created from objects that were not the signed commit"
+
+
+def remove_history(hub, src, env):
+    """Take the history pack off the hub, as if the repo had been published without one."""
+    import json as _json
+
+    ev = max((verify_manifest(e, {PK}, REPO) for e in httpx.get(f"{hub.url}/api/thub/manifests/{REPO}", timeout=10).json()["events"]), key=lambda m: m.seq)
+    x = ev.git["history"]["x"]
+    hub.store.blob_path(x).unlink()
+    hub.store.torrent_path(x).unlink()
+    return x
 
 
 def test_a_signed_table_that_the_commit_does_not_give_is_refused_by_the_client(hub, env, tmp_path):
@@ -353,10 +366,11 @@ def test_a_git_clone_from_a_machine_that_hosts_its_own_repo(tmp_path, env):
         while time.time() < end and not n.report()["branches"].get("main", {}).get("commit"):
             time.sleep(0.1)
         dst = tmp_path / "clone"
-        g(env, tmp_path, "clone", "-c", f"thub.signer={PK}", "-c", "filter.thub.clean=torrenthub filter clean", "-c", "filter.thub.smudge=torrenthub filter smudge",
-          "-c", "filter.thub.required=true", f"thub::{n.url}/{REPO}", str(dst))
+        r = g(env, tmp_path, "clone", "-c", f"thub.signer={PK}", "-c", "filter.thub.clean=torrenthub filter clean", "-c", "filter.thub.smudge=torrenthub filter smudge",
+              "-c", "filter.thub.required=true", f"thub::{n.url}/{REPO}", str(dst))
         assert head(env, dst) == head(env, made)
         assert (dst / "weights.bin").read_bytes() == BIG and (dst / "README.md").read_bytes() == FILES["README.md"]
+        assert "history of" in r.stderr and "from the swarm" in r.stderr, "the host's history came over BitTorrent"
     finally:
         n.stop()
 
@@ -465,3 +479,104 @@ def test_the_helper_refuses_to_fetch_a_commit_no_valid_manifest_signs(tmp_path, 
         h.do_fetch([f"fetch {'cd' * 20} refs/heads/main"])
     with pytest.raises(Exception, match="not what a valid manifest signs"):
         h.do_fetch([f"fetch {'ab' * 20} refs/heads/other"])
+
+
+# ------------------------------------------------------------------ history over BitTorrent
+
+def counter(hub, name) -> float:
+    import re
+
+    m = re.search(rf"^{name}(?:\{{[^}}]*\}})?\s+([0-9.e+]+)", httpx.get(f"{hub.url}/metrics", timeout=10).text, re.M)
+    return float(m.group(1)) if m else 0.0
+
+
+def test_a_clone_gets_the_history_over_bittorrent_not_from_the_pack_endpoint(hub, env, tmp_path):
+    pushed(hub, env, tmp_path)
+    packs, served = counter(hub, "thub_git_pack_total"), counter(hub, "thub_bytes_served_total")
+    r = g({**env, "THUB_CLIENT_WEBSEED": "0"}, tmp_path, "clone", "-c", f"thub.signer={PK}", remote(hub), str(tmp_path / "c"))
+    assert "from the swarm" in r.stderr and (tmp_path / "c" / "config.json").exists()
+    assert counter(hub, "thub_git_pack_total") == packs, "the hub's HTTP pack endpoint was not used"
+    assert counter(hub, "thub_bytes_served_total") == served, "and not one byte came over HTTP"
+    hist = next(iter((tmp_path / "c" / ".git" / "thub" / "packs").iterdir()))
+    assert (tmp_path / "c" / ".git" / "thub" / "torrents" / f"{hist.name}.torrent").exists(), "kept, so this clone can seed it"
+
+
+def test_a_history_pack_the_swarm_corrupts_is_never_used_and_the_clone_still_works(hub, env, tmp_path):
+    src = pushed(hub, env, tmp_path)
+    ev = max((verify_manifest(e, {PK}, REPO) for e in httpx.get(f"{hub.url}/api/thub/manifests/{REPO}", timeout=10).json()["events"]), key=lambda m: m.seq)
+    p = hub.store.blob_path(ev.git["history"]["x"])
+    bad = bytearray(p.read_bytes())
+    bad[len(bad) // 2] ^= 0xFF
+    p.write_bytes(bytes(bad))  # the hub seeds and serves these bytes; they are not the signed pack
+    before = counter(hub, "thub_git_pack_total")
+    r = g({**env, "THUB_CLIENT_WEBSEED": "0"}, tmp_path, "clone", "-c", f"thub.signer={PK}", remote(hub), str(tmp_path / "c"))
+    assert "could not be used" in r.stderr and head(env, tmp_path / "c") == head(env, src)
+    assert counter(hub, "thub_git_pack_total") == before + 1, "the commit came from the pack endpoint instead, checked against the manifest"
+    assert not list((tmp_path / "c" / ".git" / "thub" / "packs").glob("*")), "the corrupted bytes were not kept"
+
+
+def test_a_history_pack_that_lacks_the_commit_falls_back_to_the_pack_endpoint(hub, env, tmp_path):
+    src = pushed(hub, env, tmp_path)
+    ev = max((verify_manifest(e, {PK}, REPO) for e in httpx.get(f"{hub.url}/api/thub/manifests/{REPO}", timeout=10).json()["events"]), key=lambda m: m.seq)
+    h = ev.git["history"]
+    other = make_other_pack(tmp_path)
+    # a signer who names, as the history, a pack that is not this commit's: the hub would have refused it at publish, so put it in directly
+    from torrenthub.manifest import build_git_manifest
+
+    tree, parents = G.commit_fields(src, head(env, src))
+    rows = G.derive(src, head(env, src), blob_max=1 << 20, small_total=1 << 24, max_files=100, sandbox=False).rows
+    x = hashlib.sha256(other).hexdigest()
+    hub.store.put_small(x, other)
+    hub.store.add_manifest(build_git_manifest(SK, REPO, head(env, src), tree, parents, rows, ["main"], seq=99, history={"x": x, "size": len(other), "i": "11" * 20}))
+    before = counter(hub, "thub_git_pack_total")
+    r = g(env, tmp_path, "clone", "-c", f"thub.signer={PK}", remote(hub), str(tmp_path / "c"))
+    assert "could not be used" in r.stderr and head(env, tmp_path / "c") == head(env, src)
+    assert counter(hub, "thub_git_pack_total") == before + 1
+
+
+def make_other_pack(tmp_path) -> bytes:
+    other = make_repo_plain(tmp_path / "otherrepo")
+    return G.make_pack(other, g_head(other), [])
+
+
+def make_repo_plain(path):
+    path.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=path, check=True, env=GIT_ENV)
+    (path / "o.txt").write_text("other\n")
+    subprocess.run(["git", "add", "o.txt"], cwd=path, check=True, env=GIT_ENV)
+    subprocess.run(["git", "commit", "-q", "-m", "o"], cwd=path, check=True, env=GIT_ENV)
+    return path
+
+
+def g_head(path) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path, capture_output=True, text=True, env=GIT_ENV).stdout.strip()
+
+
+def test_a_second_user_gets_everything_from_the_first_while_the_hub_cannot_serve_it(hub, env, tmp_path):
+    """Whoever has fetched a file or a history pack keeps the torrent and can seed it (torrenthub seed). The hub stops seeding and
+    the second clone is told only the first clone's port: the bytes can only have come from that peer."""
+    import json as _json
+    import time
+
+    from tests.conftest import free_port
+
+    pushed(hub, env, tmp_path)
+    filt = ["-c", "filter.thub.clean=torrenthub filter clean", "-c", "filter.thub.smudge=torrenthub filter smudge", "-c", "filter.thub.required=true"]
+    g({**env, "THUB_CLIENT_WEBSEED": "0"}, tmp_path, "clone", "-c", f"thub.signer={PK}", *filt, remote(hub), str(tmp_path / "first"))
+    assert (tmp_path / "first" / "weights.bin").read_bytes() == BIG
+    port = free_port()
+    seeder = subprocess.Popen(["torrenthub", "seed", "--dir", str(tmp_path / "first"), "--listen-port", str(port), "--seconds", "90"], env={**env, "THUB_CLIENT_DHT": "0"},
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        info = _json.loads(seeder.stdout.readline())
+        assert info["seeding"] == 2 and OID in info["files"], info  # the big file and the history pack
+        for key in info["files"]:
+            run(hub.swarm.forget(hub.store.torrent_path(key)))  # the hub no longer seeds either
+        packs, served = counter(hub, "thub_git_pack_total"), counter(hub, "thub_bytes_served_total")
+        second_env = {**env, "THUB_CLIENT_WEBSEED": "0", "THUB_CLIENT_STALL": "20"}
+        g(second_env, tmp_path, "clone", "-c", f"thub.signer={PK}", "-c", f"thub.peer=127.0.0.1:{port}", *filt, remote(hub), str(tmp_path / "second"))
+        assert (tmp_path / "second" / "weights.bin").read_bytes() == BIG and head(env, tmp_path / "second") == head(env, tmp_path / "first")
+        assert counter(hub, "thub_git_pack_total") == packs and counter(hub, "thub_bytes_served_total") == served, "nothing came from the hub: the first clone served it"
+    finally:
+        seeder.terminate()
+        seeder.communicate(timeout=20)

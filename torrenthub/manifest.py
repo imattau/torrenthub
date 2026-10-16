@@ -40,6 +40,7 @@ MANIFEST_KIND = 36777
 MAX_EVENT_BYTES = 8 * 1024 * 1024
 MAX_EVENTS_PER_REPO = 200
 MAX_TABLE_BYTES = 8 * 1024 * 1024
+MAX_HISTORY_BYTES = 128 * 1024 * 1024  # the git history pack of one commit
 INLINE_ROWS = 200  # more rows than this go in a table blob by default
 SHA40 = re.compile(r"^[0-9a-f]{40}$")
 SHA64 = re.compile(r"^[0-9a-f]{64}$")
@@ -132,9 +133,10 @@ def build_manifest(secret: bytes, repo_id: str, info: dict, refs: list[str], cre
 
 def build_git_manifest(secret: bytes, repo_id: str, commit: str, tree: str, parents, rows, refs: list[str], created_at: int | None = None, *,
                        seq: int, valid_until: int | None = None, table_blob: bool | None = None, files_i: str | None = None,
-                       force: bool = False) -> dict:
+                       force: bool = False, history: dict | None = None) -> dict:
     """A signed version 3 manifest for a git commit. `rows` is the file table that `gitrepo.derive`
-    gives for it."""
+    gives for it. `history` ({"x": sha256, "size": bytes, "i": infohash}) names a pack of the commit's
+    whole history that is shared over BitTorrent like any other blob."""
     for what, v in (("commit", commit), ("tree", tree), *(("parent", p) for p in parents)):
         if not isinstance(v, str) or not SHA40.match(v):
             raise ValueError(f"{what} is not a 40 hex git id")
@@ -146,8 +148,13 @@ def build_git_manifest(secret: bytes, repo_id: str, commit: str, tree: str, pare
     rows = tuple(tuple(r) for r in rows)
     refs_s = sorted(set(refs))
     x = table_sha256(rows)
+    gitpart = {"tree": tree, "parents": list(parents), "force": bool(force)}
+    if history is not None:
+        if not _history_ok(history):
+            raise ValueError("history needs x (sha256), size and i (infohash)")
+        gitpart["history"] = {"x": history["x"], "size": history["size"], "i": history["i"]}
     body = {"v": 3, "repo": repo_id, "commit": commit, "refs": refs_s, "seq": seq, "valid_until": valid_until,
-            "git": {"tree": tree, "parents": list(parents), "force": bool(force)}, "table_sha256": x}
+            "git": gitpart, "table_sha256": x}
     tags = [["d", f"{repo_id}@{commit}"], ["repo", repo_id], ["commit", commit]] + [["ref", r] for r in refs_s] + [["seq", str(seq)]]
     if table_blob is None:
         table_blob = len(rows) > INLINE_ROWS
@@ -159,6 +166,12 @@ def build_git_manifest(secret: bytes, repo_id: str, commit: str, tree: str, pare
     else:
         body["files"] = [list(r) for r in rows]
     return sign_event(secret, MANIFEST_KIND, tags, _dump(body), ts)
+
+
+def _history_ok(h) -> bool:
+    return (isinstance(h, dict) and set(h) == {"x", "size", "i"} and isinstance(h["x"], str) and bool(SHA64.match(h["x"]))
+            and isinstance(h["size"], int) and not isinstance(h["size"], bool) and 0 < h["size"] <= MAX_HISTORY_BYTES
+            and isinstance(h["i"], str) and bool(SHA40.match(h["i"])))
 
 
 def with_table(m: Manifest, table: bytes) -> Manifest:
@@ -220,7 +233,8 @@ def verify_manifest(ev: dict, allowed: set[str], repo_id: str, table: bytes | No
         files = body.get("files", [])
         if v == 3:
             git = body.get("git")
-            if (not isinstance(git, dict) or set(git) != {"tree", "parents", "force"} or not isinstance(git["tree"], str) or not SHA40.match(git["tree"])
+            if (not isinstance(git, dict) or not {"tree", "parents", "force"} <= set(git) <= {"tree", "parents", "force", "history"}
+                    or ("history" in git and not _history_ok(git["history"])) or not isinstance(git["tree"], str) or not SHA40.match(git["tree"])
                     or not isinstance(git["parents"], list) or len(git["parents"]) > 16
                     or not all(isinstance(p, str) and SHA40.match(p) for p in git["parents"]) or not isinstance(git["force"], bool)):
                 raise ManifestInvalid("bad git field")

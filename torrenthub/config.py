@@ -144,6 +144,7 @@ class Settings:
     publish_git_small_total: int = 64 * 1024 * 1024  # all plain (non pointer) files of one commit together
     publish_git_max_objects: int = 100_000  # objects in the whole history
     publish_git_timeout: float = 60.0  # per git command
+    publish_git_history_max: int = 128 * 1024 * 1024  # a commit's whole history as one pack
     publish_allow_force: bool = False  # accept a manifest that moves a branch to a commit that does not descend from it
     git_pack_per_ip_per_minute: float = 30.0  # pack requests per address
     git_http_per_ip_per_minute: float = 120.0  # smart HTTP and LFS requests per address
@@ -227,6 +228,7 @@ class Settings:
             publish_git_small_total=parse_size(e("THUB_PUBLISH_GIT_SMALL_TOTAL"), 64 * 1024 * 1024),
             publish_git_max_objects=int(e("THUB_PUBLISH_GIT_MAX_OBJECTS", "100000")),
             publish_git_timeout=float(e("THUB_PUBLISH_GIT_TIMEOUT", "60")),
+            publish_git_history_max=parse_size(e("THUB_PUBLISH_GIT_HISTORY_MAX"), 128 * 1024 * 1024),
             publish_allow_force=_bool(e("THUB_PUBLISH_ALLOW_FORCE"), False),
             git_http_per_ip_per_minute=float(e("THUB_GIT_HTTP_PER_IP_MINUTE", "120")),
             git_http_max_body=parse_size(e("THUB_GIT_HTTP_MAX_BODY"), 4 * 1024 * 1024),

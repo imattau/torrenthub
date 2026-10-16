@@ -255,7 +255,18 @@ git clone -c thub.signer=<owner key> -c filter.thub.clean="torrenthub filter cle
 
 A clone only follows branches that a manifest signed by a pinned key vouches for, and checks the commit and its file table against that manifest; the hub is not trusted. Without the filter options a clone has pointers in place of big files; `torrenthub pull-files` fills them in. `THUB_SKIP_SMUDGE=1` does the same during checkout. Use `thub::http://host:port/you/model` for a hub without TLS. Details and limits: `PROTOCOL.md` section 20.
 
-### Stock git and git-lfs, no helper
+### The bytes travel over BitTorrent
+
+Git is how an author versions their own repo; distribution is the swarm. A clone through `git-remote-thub` gets the git **history** as a pack that is itself a torrent (its sha256, size and infohash are in the signed manifest) and each **big file** by torrent, with the hub as one direct peer, any trackers or DHT you have, and `thub.peer` hints. Plain HTTP from the hub is the fallback when the swarm has nobody. Whatever arrives is hashed before it is kept. A clone can then share what it fetched:
+
+```bash
+torrenthub seed --listen-port 6881        # seeds the big files and history packs this clone fetched
+git clone -c thub.peer=friend.example:6881 -c thub.signer=<owner key> thub://hub.example/you/model   # gets them from a peer
+```
+
+Settings (git config, or the environment variable shown): `thub.swarm` (`THUB_CLIENT_SWARM`), `thub.peer` (`THUB_PEERS`), `thub.tracker` (`THUB_TRACKERS`), `thub.dht` (`THUB_CLIENT_DHT`), `thub.webseed` (`THUB_CLIENT_WEBSEED`), `thub.swarmStall` / `thub.swarmTimeout` (`THUB_CLIENT_STALL`, `THUB_CLIENT_TIMEOUT`). `PROTOCOL.md` section 22 has the details and what is not shown (discovery across real networks).
+
+### Stock git and git-lfs, no helper (a convenience over HTTP)
 
 A hub with a published or hosted repo also speaks read-only smart HTTP and the git-lfs download API, so anyone can:
 

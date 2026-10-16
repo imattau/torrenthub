@@ -24,7 +24,7 @@ import httpx
 
 from .federation import fingerprint
 from . import gitrepo
-from .manifest import build_git_manifest, build_manifest, content_commit, table_bytes
+from .manifest import MAX_HISTORY_BYTES, build_git_manifest, build_manifest, content_commit, table_bytes
 from .torrent import PieceHasher, build_torrent, choose_piece_length
 
 TORRENT_MIN = 1024 * 1024  # files at least this big go by torrent, smaller ones are sent in the request
@@ -75,13 +75,13 @@ class Publication:
 
 
 def _stage(body: dict, stage: Path, torrents: dict, state: dict, sha: str, source: Path, size: int, pieces: bytes,
-           trackers, *, label: str) -> None:
+           trackers, *, label: str, force_torrent: bool = False) -> None:
     """Send a small file in the request, or make a torrent for a big one and put the bytes where
     libtorrent will look for them (under the torrent's name)."""
     if sha in state["seen"]:
         return
     state["seen"].add(sha)
-    if size < TORRENT_MIN and state["inline_used"] + size <= INLINE_BUDGET:
+    if not force_torrent and size < TORRENT_MIN and state["inline_used"] + size <= INLINE_BUDGET:
         body["inline"][sha] = base64.b64encode(source.read_bytes()).decode()
         state["inline_used"] += size
         return
@@ -191,8 +191,11 @@ def prepare_git(secret: bytes, repo: str, git_dir: Path, stage: Path, *, rev: st
     except gitrepo.GitError as e:
         raise ValueError(str(e)) from e
     ts = int(created_at if created_at is not None else time.time())
+    stage = Path(stage)
+    stage.mkdir(parents=True, exist_ok=True)
+    history = make_history(git_dir, head, stage, trackers)
     ev = build_git_manifest(secret, repo, head, d.tree, d.parents, d.rows, list(refs), created_at=ts, seq=seq,
-                            valid_until=int(ts + valid_for) if valid_for else None, force=force)
+                            valid_until=int(ts + valid_for) if valid_for else None, force=force, history=history["entry"])
     body: dict = {"manifest": ev, "inline": {}, "torrents": {}}
     if any(t[0] == "files_x" for t in ev["tags"]):
         body["table"] = base64.b64encode(table_bytes(d.rows)).decode()
@@ -202,9 +205,7 @@ def prepare_git(secret: bytes, repo: str, git_dir: Path, stage: Path, *, rev: st
     except gitrepo.GitError as e:
         raise ValueError(str(e)) from e
     body["git"] = {"head": head, "pack": base64.b64encode(pack).decode()}
-
-    stage = Path(stage)
-    stage.mkdir(parents=True, exist_ok=True)
+    body["torrents"][history["entry"]["x"]] = base64.b64encode(history["torrent"]).decode()
     # Big files the hub already holds, through a commit it has, are not hashed or sent again.
     held: set[str] = set()
     for h in known:
@@ -230,7 +231,28 @@ def prepare_git(secret: bytes, repo: str, git_dir: Path, stage: Path, *, rev: st
         if h.hexdigest() != oid:
             raise ValueError(f"{src} does not hash to the oid its pointer names ({oid[:12]}); is it the right version of the file?")
         _stage(body, stage, torrents, state, oid, src, size, ph.finish(), trackers, label=str(src))
+    torrents[history["entry"]["x"]] = (history["torrent_path"], history["torrent"])
     return Publication(body, ev, head, torrents, stage)
+
+
+def make_history(git_dir: Path, head: str, stage: Path, trackers=None) -> dict:
+    """The whole history of `head` as one pack, with a torrent for it, staged for seeding. It is what a
+    clone fetches over BitTorrent; the signed manifest names its sha256, size and infohash."""
+    return history_from_pack(gitrepo.make_pack(git_dir, head, []), head, stage, trackers)
+
+
+def history_from_pack(pack: bytes, head: str, stage: Path, trackers=None) -> dict:
+    if len(pack) > MAX_HISTORY_BYTES:
+        raise ValueError(f"the history of {head[:12]} is {len(pack):,} bytes as a pack; the limit is {MAX_HISTORY_BYTES:,}. Large files belong in LFS pointers, not in git")
+    sha = hashlib.sha256(pack).hexdigest()
+    ph = PieceHasher(choose_piece_length(len(pack)))
+    ph.update(pack)
+    data, ih = build_torrent(name=sha, length=len(pack), piece_length=choose_piece_length(len(pack)), pieces=ph.finish(),
+                             trackers=trackers or [], comment="torrenthub git history")
+    tpath = Path(stage) / f"{sha}.torrent"
+    tpath.write_bytes(data)
+    (Path(stage) / sha).write_bytes(pack)  # where libtorrent looks for the bytes: under the torrent's name
+    return {"entry": {"x": sha, "size": len(pack), "i": ih}, "torrent": data, "torrent_path": tpath}
 
 
 async def hub_heads(client: httpx.AsyncClient, hub: str, repo: str) -> list[str]:
