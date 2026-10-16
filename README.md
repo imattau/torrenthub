@@ -264,6 +264,8 @@ torrenthub seed --listen-port 6881        # seeds the big files and history pack
 git clone -c thub.peer=friend.example:6881 -c thub.signer=<owner key> thub://hub.example/you/model   # gets them from a peer
 ```
 
+The hub is also a BitTorrent tracker (`<public url>/announce`, on by default; `THUB_TRACKER=0` turns it off), and every torrent it hands out names it. So a clone that has fetched a file and runs `torrenthub seed` is found by the next clone through the hub, with nobody typing an address; `thub.peer` is only needed where the tracker cannot help. The tracker answers only for torrents the hub holds, records the address each connection came from, and is rate limited. It cannot get two peers that are both behind NAT to reach each other.
+
 Settings (git config, or the environment variable shown): `thub.swarm` (`THUB_CLIENT_SWARM`), `thub.peer` (`THUB_PEERS`), `thub.tracker` (`THUB_TRACKERS`), `thub.dht` (`THUB_CLIENT_DHT`), `thub.webseed` (`THUB_CLIENT_WEBSEED`), `thub.swarmStall` / `thub.swarmTimeout` (`THUB_CLIENT_STALL`, `THUB_CLIENT_TIMEOUT`). `PROTOCOL.md` section 22 has the details and what is not shown (discovery across real networks).
 
 ### Stock git and git-lfs, no helper (a convenience over HTTP)

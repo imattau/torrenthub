@@ -20,6 +20,7 @@ Configuration (git config first, then the environment):
   thub.tracker (repeatable) / THUB_TRACKERS   extra trackers
   thub.dht / THUB_CLIENT_DHT=0         turn DHT and local discovery off
   thub.webseed / THUB_CLIENT_WEBSEED=0 do not give libtorrent the hub's web seed (so only peers count)
+  thub.hubpeer / THUB_CLIENT_HUBPEER=0 do not offer the hub's swarm port as a direct peer (so trackers, DHT and hints do the finding)
   thub.swarmTimeout, thub.swarmStall / THUB_CLIENT_TIMEOUT, THUB_CLIENT_STALL   seconds
 """
 
@@ -50,6 +51,7 @@ class SwarmConfig:
     trackers: list = field(default_factory=list)
     dht: bool = True
     webseed: bool = True
+    hubpeer: bool = True  # offer the hub's own swarm port as a peer; off, only trackers, DHT and hints find peers
     timeout: float = 3600.0
     stall: float = 30.0
     listen_port: int = 0
@@ -83,6 +85,7 @@ def config_from_env(cwd=None) -> SwarmConfig:
     num = lambda k, env, d: float(os.environ.get(env) or (_git_values(k, cwd) or [d])[-1])
     return SwarmConfig(enabled=_flag("thub.swarm", "THUB_CLIENT_SWARM", True, cwd), peers=parse_peers(peers), trackers=trackers,
                        dht=_flag("thub.dht", "THUB_CLIENT_DHT", True, cwd), webseed=_flag("thub.webseed", "THUB_CLIENT_WEBSEED", True, cwd),
+                       hubpeer=_flag("thub.hubpeer", "THUB_CLIENT_HUBPEER", True, cwd),
                        timeout=num("thub.swarmTimeout", "THUB_CLIENT_TIMEOUT", "3600"), stall=num("thub.swarmStall", "THUB_CLIENT_STALL", "30"))
 
 
@@ -137,7 +140,7 @@ async def _via_swarm(hub, key, size, dest, work, infohash, cfg, keep_torrent, sa
     peers = list(cfg.peers)
     port = (info.get("swarm") or {}).get("port")
     host = urlsplit(hub).hostname
-    if port and host:
+    if port and host and cfg.hubpeer:
         peers.append((host, int(port)))
     torrent = work / f"{key}.torrent"
     torrent.write_bytes(sanitize_torrent(raw, trackers, [f"{hub}/blobs/{key}"] if cfg.webseed else []))

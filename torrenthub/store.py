@@ -261,6 +261,13 @@ class Store:
                 (row.key, row.size, row.sha256, row.state, row.infohash, row.piece_length, row.last_access),
             )
 
+    def held_by_infohash(self, infohash_hex: str) -> str | None:
+        """The key of a complete, unblocked blob with this torrent infohash, or None."""
+        with self._lock:
+            r = self._db.execute("SELECT key FROM blobs WHERE infohash=? AND state='complete' "
+                                 "AND key NOT IN (SELECT key FROM blocked) LIMIT 1", (infohash_hex,)).fetchone()
+        return r["key"] if r else None
+
     def put_small(self, key: str, data: bytes) -> None:
         """Store a whole small blob whose key is the sha256 of its bytes (the caller has checked that)."""
         path, tmp = self.blob_path(key), self.tmp_path(key)

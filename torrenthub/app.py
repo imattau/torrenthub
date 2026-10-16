@@ -25,9 +25,10 @@ from .gaplog import GapLog
 from .mirror import Inflight, Mirror
 from .policy import check_file, load_policy
 from .publish import REPO_NAME, Ingest, PublishError
+from .tracker import Tracker, own_endpoint, parse_query
 from .store import Store, valid_key
 from .swarm import Swarm, make_swarm
-from .torrent import magnet
+from .torrent import TorrentRejected, magnet, with_tracker
 from .upstream import HubError, Upstream, UpstreamSet, make_upstream
 
 OnBytes = Callable[[int], None]
@@ -378,6 +379,9 @@ def create_app(
     policy_rules = load_policy(settings.policy)
     if isinstance(upstream, UpstreamSet) and upstream.manifest_max_age is None:
         upstream.manifest_max_age = policy_rules.freshness.manifest_max_age  # the environment setting wins if both are given
+    tracker = Tracker(settings.tracker_interval, max_peers=settings.tracker_max_peers)
+    if swarm.enabled:
+        tracker.self_peer = own_endpoint(settings.public_url, settings.listen_port)
     mirror = Mirror(settings, store, upstream, swarm, metrics)
     ingest = Ingest(settings, store, swarm, pinned, lambda: admission.graph(), metrics)
 
@@ -416,8 +420,10 @@ def create_app(
         "/api/thub/git/": (20, settings.git_pack_per_ip_per_minute),
         "*/git-upload-pack": (30, settings.git_http_per_ip_per_minute),
         "*/info/refs": (30, settings.git_http_per_ip_per_minute),
-        "*/info/lfs/objects/batch": (30, settings.git_http_per_ip_per_minute)})
+        "*/info/lfs/objects/batch": (30, settings.git_http_per_ip_per_minute),
+        "*/announce": (30, settings.tracker_per_ip_per_minute)})
     app.state.mirror = mirror
+    app.state.tracker = tracker
     app.state.ingest = ingest
     app.state.store = store
     app.state.metrics = metrics
@@ -584,7 +590,39 @@ def create_app(
     async def hub_info():
         """What a client needs to join this hub's swarm directly, besides trackers and DHT."""
         return {"swarm": {"enabled": bool(swarm.enabled), "port": settings.listen_port if swarm.enabled else None},
-                "public_url": settings.public_url, "trackers": list(settings.trackers)}
+                "public_url": settings.public_url, "trackers": list(settings.trackers),
+                "tracker": f"{settings.public_url}/announce" if settings.tracker and swarm.enabled else None}
+
+    @app.get("/announce")
+    async def announce(request: Request):
+        """A BitTorrent tracker for the torrents this hub holds (tracker.py). Answers are bencoded, errors
+        included, with a 200: that is what clients expect."""
+        def fail(why: str, result: str):
+            metrics.inc("thub_tracker_announce_total", result=result)
+            return Response(Tracker.failure(why), media_type="text/plain")
+
+        if not (settings.tracker and swarm.enabled):
+            return fail("this hub does not run a tracker", "off")
+        q = parse_query(request.scope["query_string"])
+        ih = q.get("info_hash", b"")
+        key = store.held_by_infohash(ih.hex()) if len(ih) == 20 else None
+        if key is None:
+            return fail("this tracker only serves torrents held by this hub", "unknown")
+        try:
+            port = int(q.get("port", b"0"))
+            left = int(q["left"]) if "left" in q else None
+            want = int(q.get("numwant", b"50"))
+        except ValueError:
+            return fail("bad number in the announce", "bad")
+        client = request.client.host if request.client else ""
+        out = tracker.announce(ih, client, port, q.get("peer_id", b""), left, q.get("event", b"").decode("latin-1"), want,
+                               compact=q.get("compact", b"1") != b"0", held_here=True)
+        metrics.inc("thub_tracker_announce_total", result="ok")
+        return Response(out, media_type="text/plain")
+
+    @app.get("/api/thub/tracker")
+    async def tracker_stats():
+        return {"enabled": bool(settings.tracker and swarm.enabled), "self": list(tracker.self_peer) if tracker.self_peer else None, **tracker.stats()}
 
     @app.get("/api/thub/git/{owner}/{name}/refs")
     async def git_refs(owner: str, name: str):
@@ -799,6 +837,11 @@ def create_app(
         if not valid_key(key) or store.is_blocked(key) or not store.torrent_path(key).exists():
             raise HubError(404, "EntryNotFound", "no such torrent")
         p = store.torrent_path(key)
+        if settings.tracker and swarm.enabled:  # every torrent this hub hands out also names this hub's tracker
+            try:
+                return Response(with_tracker(p.read_bytes(), f"{settings.public_url}/announce"), media_type="application/x-bittorrent")
+            except (TorrentRejected, ValueError):
+                pass
         return FileResponse(p, media_type="application/x-bittorrent")
 
     @app.api_route("/blobs/{key}", methods=["GET", "HEAD"])

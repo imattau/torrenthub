@@ -146,6 +146,10 @@ class Settings:
     publish_git_timeout: float = 60.0  # per git command
     publish_git_history_max: int = 128 * 1024 * 1024  # a commit's whole history as one pack
     publish_allow_force: bool = False  # accept a manifest that moves a branch to a commit that does not descend from it
+    tracker: bool = True  # answer BitTorrent announces for the torrents this hub holds, at <public url>/announce
+    tracker_interval: int = 600
+    tracker_max_peers: int = 300
+    tracker_per_ip_per_minute: float = 120.0
     git_pack_per_ip_per_minute: float = 30.0  # pack requests per address
     git_http_per_ip_per_minute: float = 120.0  # smart HTTP and LFS requests per address
     git_http_max_body: int = 4 * 1024 * 1024  # largest git-upload-pack request body
@@ -232,6 +236,10 @@ class Settings:
             publish_allow_force=_bool(e("THUB_PUBLISH_ALLOW_FORCE"), False),
             git_http_per_ip_per_minute=float(e("THUB_GIT_HTTP_PER_IP_MINUTE", "120")),
             git_http_max_body=parse_size(e("THUB_GIT_HTTP_MAX_BODY"), 4 * 1024 * 1024),
+            tracker=_bool(e("THUB_TRACKER"), True),
+            tracker_interval=int(e("THUB_TRACKER_INTERVAL", "600")),
+            tracker_max_peers=int(e("THUB_TRACKER_MAX_PEERS", "300")),
+            tracker_per_ip_per_minute=float(e("THUB_TRACKER_PER_IP_MINUTE", "120")),
             git_pack_per_ip_per_minute=float(e("THUB_GIT_PACK_PER_IP_MINUTE", "30")),
             serve_git_max_pack=parse_size(e("THUB_SERVE_GIT_MAX_PACK"), 256 * 1024 * 1024),
             publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),

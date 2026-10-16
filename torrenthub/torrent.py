@@ -247,6 +247,29 @@ def sanitize_torrent(data: bytes, trackers: list[str] | None = None, webseeds: l
     return out + b"e"
 
 
+def torrent_lists(data: bytes) -> tuple[list[str], list[str]]:
+    """(trackers, web seeds) named in a torrent."""
+    meta = bdecode(data)
+    trackers = []
+    if isinstance(meta.get(b"announce"), bytes):
+        trackers.append(meta[b"announce"].decode("utf-8", "replace"))
+    for tier in meta.get(b"announce-list", []) or []:
+        for t in tier if isinstance(tier, list) else [tier]:
+            if isinstance(t, bytes):
+                trackers.append(t.decode("utf-8", "replace"))
+    ws = meta.get(b"url-list", [])
+    ws = [ws] if isinstance(ws, bytes) else ws
+    return list(dict.fromkeys(trackers)), [w.decode("utf-8", "replace") for w in ws if isinstance(w, bytes)]
+
+
+def with_tracker(data: bytes, announce: str) -> bytes:
+    """The same torrent (same infohash) that also names `announce` as a tracker."""
+    trackers, webseeds = torrent_lists(data)
+    if announce in trackers:
+        return data
+    return sanitize_torrent(data, [announce, *trackers], webseeds)
+
+
 def strip_webseeds(data: bytes) -> bytes:
     """Remove web seed URLs from a torrent. The infohash does not change, because web
     seeds live outside the info dict. Used so a client downloads from peers only."""

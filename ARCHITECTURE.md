@@ -75,7 +75,7 @@ Content addressed. Blob key is the LFS sha256, or `git-<blobId>` for plain git f
 - **Piece length policy is a protocol constant.** Smallest power of two from 256 KiB to 16 MiB giving at most 2048 pieces. Changing it changes every infohash, so it is versioned (`PIECE_POLICY_VERSION`).
 - **Web seeds (BEP-19)** point at the gateway's `/blobs/<key>` and, optionally, the upstream resolve URL. New torrents are downloadable on day one before any peer exists.
 - **BitTorrent v1 (SHA-1 pieces).** v1 has the widest client support. SHA-1 weakness is covered by checking the file's sha256 against the value upstream advertises, before the blob is published (tested with corrupt bytes). A v2 or hybrid torrent is a possible later change, but it changes every infohash.
-- **Discovery:** DHT plus configured trackers. A first-party tracker is not built.
+- **Discovery:** the hub's own tracker (`PROTOCOL.md` section 23), plus DHT and configured trackers.
 
 ## 6. Request flows
 
@@ -293,6 +293,7 @@ The direction since then is **participants**: humans and AI agents on equal term
 | P4 (built, see `PROTOCOL.md` section 15: manifest v2, publish endpoint and command, quotas; gate met against a firewalled publisher, not a real router) | Publishing path for artifacts, quotas, manifest v2 (`seq`, `valid_until`, large tables as blobs) | A publisher behind NAT gets an artifact onto a hub and an agent fetches it fully verified |
 | P5 (built, see `PROTOCOL.md` section 16: request, claim and result events, the judging rule, `torrenthub request` and `work`, freshness rules; gate met on two machines with trust set up beforehand) | Requests, claims, results, freshness policies | Two agents complete a request cycle with no human step |
 | P6 (built, see `PROTOCOL.md` section 17: relay client, push and pull, trust-following pull, a probe; gate met against a local strfry, not a public relay) | Nostr relay adapter | Events round trip through a real relay |
+| D1 (built, see `PROTOCOL.md` section 23: the hub's own BitTorrent tracker; peers found with no address given) | Discovery | A client with no hint and no hub swarm port finds a seeder and takes the file from it |
 | H5 (built, see `PROTOCOL.md` section 22: big files and git history of a clone come over BitTorrent first, clones seed back; gate met on three machines with the hub's swarm port closed) | Swarm first | A clone's bytes come from peers and are checked; the hub is not needed to serve them |
 | H4 (built, see `PROTOCOL.md` section 21: smart HTTP clone and the git-lfs batch API; gate met with stock git and stock git-lfs on a VM) | Stock git against a hub | `git clone https://hub/owner/name` and `git lfs` fetch a repo with no helper; `verify-git` checks it against the signed manifests |
 | H3 (built, see `PROTOCOL.md` section 20: `git-remote-thub`, the big-file filter; gate met between a firewalled VM and a hub) | Plain git against a hub | A user pushes and clones with plain git and no git-lfs, verified against a pinned key |
