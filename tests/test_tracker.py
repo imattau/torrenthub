@@ -229,3 +229,12 @@ def test_a_new_client_finds_a_seeder_through_the_tracker_with_no_address_given_t
         assert http_bytes(hub) == before, "not a byte over HTTP: it came from A, whom B found through the tracker"
     finally:
         run(a_swarm.close())
+
+
+def test_one_address_cannot_fill_a_torrent_with_its_own_ports():
+    tr = Tracker(per_ip=4)
+    for port in range(7000, 7010):
+        tr.announce(IH, "10.0.0.1", port, b"p" * 20, 0, "started", 0)
+    assert len(tr.peers_of(IH)) == 4
+    tr.announce(IH, "10.0.0.2", 7000, b"q" * 20, 0, "started", 0)
+    assert len(tr.peers_of(IH)) == 5, "another address is still welcome"

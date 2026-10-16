@@ -632,3 +632,48 @@ def test_a_manifest_with_a_malformed_history_field_is_invalid():
     forged = sgn.sign_event(SK, ev["kind"], ev["tags"], json.dumps(body, separators=(",", ":"), sort_keys=True), ev["created_at"])
     with pytest.raises(ManifestInvalid, match="git field"):
         verify_manifest(forged, {PK}, REPO)
+
+
+# ------------------------------------------------------------------ each layer refuses on its own
+# The checks below are also guarded by another layer (git's own --strict fsck, the manifest rules).
+# These tests call the layer directly, so removing one safeguard is noticed even though another
+# would still have stopped the same publication.
+
+def _tree_with(root, name: str) -> str:
+    blob = git(root, "hash-object", "-w", "--stdin", input=b"x\n")
+    return subprocess.run(["git", "-C", str(root), "mktree", "--missing"], input=f"100644 blob {blob}\t{name}\n".encode(),
+                          capture_output=True, env=GIT_ENV, check=True).stdout.decode().strip()
+
+
+@pytest.mark.parametrize("name", ["..", ".", "a\\b", "with\x01control"])
+def test_derive_refuses_a_path_that_could_leave_the_folder(tmp_path, name):
+    root = make_repo(tmp_path, files=FILES)
+    tree = _tree_with(root, name)
+    c = git(root, "commit-tree", tree, "-m", "hostile")
+    with pytest.raises(G.GitError, match="unsafe path"):
+        G.derive(root, c, blob_max=1 << 20, small_total=1 << 24, max_files=100)
+
+
+@pytest.mark.parametrize("name", [".git", ".GIT", ".Git"])
+def test_derive_refuses_a_dot_git_component_in_any_case(tmp_path, name):
+    root = make_repo(tmp_path, files=FILES)
+    tree = _tree_with(root, name)
+    c = git(root, "commit-tree", tree, "-m", "hostile")
+    with pytest.raises(G.GitError, match=r"\.git"):
+        G.derive(root, c, blob_max=1 << 20, small_total=1 << 24, max_files=100)
+
+
+def test_index_pack_refuses_what_is_not_a_pack_before_running_git(tmp_path):
+    repo = tmp_path / "bare.git"
+    G.init_bare(repo)
+    with pytest.raises(G.GitError, match="not a git pack"):
+        G.index_pack(repo, b"NOT A PACK AT ALL", max_pack=1 << 20)
+
+
+def test_a_manifest_naming_a_path_like_repo_is_refused_as_such(hub, tmp_path):
+    root = make_repo(tmp_path, files=FILES)
+    body = raw_body(root)
+    for bad in ("../etc/passwd", "no-slash", "a/b/c", ""):
+        ev = build_git_manifest(SK, bad, body["git"]["head"], *G.commit_fields(root, body["git"]["head"]), (("x.txt", 1, "00" * 32, None),), ["main"], seq=1)
+        code, err, msg = send(hub, {**body, "manifest": ev})
+        assert code == 400 and "valid repo" in msg, (bad, code, msg)
