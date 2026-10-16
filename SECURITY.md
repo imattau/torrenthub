@@ -28,6 +28,10 @@ what is known to be weak. Treat the project as a prototype.
 
 New surface: a hub runs `git` on objects a publisher chose. The measures are in `PROTOCOL.md` section 18; the ones that matter here: every command runs in a fresh repository the hub controls, with no system or user config, no hooks and no templates, with a time limit and a file size limit; the pack is size capped; `index-pack --strict` checks the objects; the tree is refused if it holds a symlink, submodule, `.git` component, case collision or a large non-pointer file; nothing is kept until the whole publication has succeeded. What is not covered: a pack built to inflate (small on the wire, large when read) costs CPU until the time limit stops it (measured: 4.2 MB holding 4 GiB took 8.8 s to index; the limit cut it off when set lower), and only a signer the hub authorised reaches git at all; git itself (a parser of hostile input written in C) is a dependency this review did not read; and a hub that sets `THUB_PUBLISH_ALLOW_FORCE=1` lets a signer rewrite a branch it was allowed to publish.
 
+## Hosting from your own machine (added with H2)
+
+`torrenthub host` is a hub that listens (on every address unless `--bind` says otherwise) and holds the owner's signing key in a process that stays up. The key is read from a file and is not behind the signer process: whoever can read the file, or the process, can sign as the owner. The host serves files by link from the owner's working tree, so what it serves depends on files the owner or another program can change; a change is noticed within one poll and the file is withdrawn, but not before. It takes no uploads (publishing is off) and asks no upstream. It was not tested against a malicious consumer beyond the ordinary hub endpoints.
+
 ## Dependencies
 
 `pip-audit` (2026-10-16) found no known vulnerabilities in `lock/runtime.txt` (36 packages, everything a deployment installs) or `lock/dev.txt`. The earlier run's only findings were against `pip` 24.0 in a development environment, since upgraded.

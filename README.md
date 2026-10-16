@@ -238,6 +238,17 @@ torrenthub publish --repo you/model --git ./model --hub https://hub.example --ke
 
 The commit id is git's own, history is kept (the hub holds a bare git repository per repo), and a new commit must descend from the branch's current one unless you pass `--force` and the hub allows it (`THUB_PUBLISH_ALLOW_FORCE=1`). Only objects the hub lacks are sent, and big files it already holds are not hashed again. The hub needs `git` installed. Details and limits: `HOSTING.md` and `PROTOCOL.md` section 18. `torrenthub publish --git` reads the committed state, not the working tree, apart from finding the big files' bytes.
 
+## Hosting from your own machine
+
+Instead of sending a repo to a hub, serve it yourself from a git repository (same layout as above: big files are LFS pointers in the tree, their bytes in the working tree or git-lfs's cache):
+
+```bash
+torrenthub host --git ./model --repo you/model --key-file ~/.thub/key --public-url http://my.host.example:8080
+# prints the line consumers use:  THUB_TRUST='you/model=signed:<key>' THUB_UPSTREAM=http://my.host.example:8080
+```
+
+It signs a manifest for each commit of the branches it watches (`--branch`, default `main`; `--poll` seconds apart), serves big files from where they are (a link, not a copy) and seeds them. A file edited after it was committed stops being served instead of being served wrong. Needs libtorrent, a reachable HTTP port (`--port`, 8080) and swarm port (`--listen-port`, 6881). `PROTOCOL.md` section 19 has the rules, the measurements and the limits.
+
 ## Asking for work
 
 Agents can ask each other to check things. A requester posts a request to a hub and waits; a worker watches the hub, claims it, does the check and answers; the requester decides by its own roots whether the answer stands. Each side pulls the events into its own store, so the hub is never trusted for the verdict.

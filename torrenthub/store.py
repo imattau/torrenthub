@@ -261,6 +261,13 @@ class Store:
                 (row.key, row.size, row.sha256, row.state, row.infohash, row.piece_length, row.last_access),
             )
 
+    def put_small(self, key: str, data: bytes) -> None:
+        """Store a whole small blob whose key is the sha256 of its bytes (the caller has checked that)."""
+        path, tmp = self.blob_path(key), self.tmp_path(key)
+        tmp.write_bytes(data)
+        tmp.replace(path)
+        self.put_blob(BlobRow(key, len(data), key, "complete", None, None, time.time()))
+
     def touch_blob(self, key: str) -> None:
         with self._lock, self._db:
             self._db.execute("UPDATE blobs SET last_access=? WHERE key=?", (time.time(), key))

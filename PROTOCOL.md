@@ -192,6 +192,7 @@ Validation (`validation/README.md`) is the gate. Nothing below is started until 
 | P5 (built, section 16; gate met on two machines, with trust set up beforehand) | Requests, claims, results. Freshness policies. Payments stay outside. | Two agents complete a request cycle with no human step |
 | P6 (built, section 17; gate met against a local strfry and a lenient relay, not a public one) | Nostr relay adapter | Events round trip through a real relay, with size limits known |
 | H1 (built, section 18; `HOSTING.md`) | Git backed publishing: manifest v3, `publish --git`, the hub derives the file table from the git objects | A git repo with pointers is published from behind a firewall and fetched verified; hostile packs are refused |
+| H2 (built, section 19; `HOSTING.md`) | `torrenthub host`: serve a repo from a git repository on this machine, big files in place, a manifest signed on each branch change | One machine hosts, another pinned to the owner's key fetches from it with nothing else involved |
 
 Public service questions (who pays for the first copy, takedown and abuse policy, IP exposure) stay open in `ARCHITECTURE.md` and are not answered by any phase above.
 
@@ -429,3 +430,25 @@ Design and reasons: `HOSTING.md`. Code: `gitrepo.py` (running git safely, derivi
 - Only the command line was exercised.
 - A repo cannot change between git backed and not. Refused with `409 WrongKind`.
 - Default limits: 100,000 objects of history, 32 MiB of pack, 8 MiB per plain file, 64 MiB of plain files in a commit, 5,000 files.
+
+## 19. What is built (H2: hosting from your own machine)
+
+Design: `HOSTING.md`. Code: `host.py` (the watcher, `build_host_app`), `torrenthub host` in `cli_events.py`, `Store.put_small`. Tests: `tests/test_host.py`.
+
+`torrenthub host --git DIR --repo owner/name --key-file K --public-url URL` runs an ordinary hub whose repo comes from a git repository on this machine instead of from a mirror or a publication. Every `--poll` seconds (default 10) it looks at each watched branch (`--branch`, default `main`). For a commit it has not served it derives the file table (the same `gitrepo.derive` the publish path uses, with the same limits), finds each big file's bytes (working tree, git-lfs cache, `.git/thub/objects`, `--files-from`), hashes it once against its pointer, builds the torrent, and **links** the file into the store (a hard link, or a symbolic link across file systems) so the same bytes are served over HTTP and seeded to the swarm with no second copy. Only then does it sign a version 3 manifest and make the commit visible. Consumers pin the owner's key as for any signed repo.
+
+Rules: branches at the same commit share one manifest; moving one branch signs a new manifest that names only it, and the others keep their old one. A branch whose new commit does not descend from the one served is signed with `force: true`, because that is what happened (a hub that later mirrors it may refuse that unless it allows rewrites). With `--valid-days N` the manifests expire, and the host signs the current commit again, with the next `seq`, when half the time has passed. The host takes no publications (`THUB_PUBLISH_QUOTA` is 0) and asks no upstream.
+
+Keeping the promise of "in place": the state of each served file (size and modification time of the link's target) is saved in `host-state.json` in the data directory, so a restart hashes nothing again. Each pass compares them; a changed file is hashed again, and if it no longer matches its pointer it is **withdrawn** (its link removed, seeding stopped, readers get an error instead of bytes they would reject) and the problem is shown at `GET /api/thub/host` and in the log. When the right bytes come back, it serves again. A hard link keeps the old bytes when git replaces a file (a checkout writes a new file), so that case is neither noticed nor a problem; an editor writing into the same file is noticed within one poll. A missing file or a tree the publish path would refuse (symlink, submodule, case collision, large non-pointer file) keeps the last good commit served and reports the error.
+
+**Measured.** Two VMs on a libvirt network: the host on one (a git repo of Qwen2.5-0.5B, 988 MB weights as a pointer, `torrenthub host`), a pinned agent on the other with only the host as upstream (`THUB_TRUST=Qwen/*=signed:<owner key>`, `THUB_PEERS` naming the host). A stock `huggingface_hub` on the physical machine fetched ten files through the agent in 6.7 s; all ten were identical to the owner's; 988,097,824 bytes came from the swarm (the host), 11.5 MB of small files over HTTP, one valid manifest, no fallbacks and no integrity failures. The host's stored blob and the working-tree file were the same inode. A commit on the host was signed as `seq` 2 and served by the agent within six seconds (poll 3 s, agent `THUB_REF_TTL=0`).
+
+**Not done, and limits.**
+- This does not show that discovery works across networks. The agent was given the host's address; both VMs are on one virtual switch. Behind NAT a host is only reachable if its HTTP and swarm ports are forwarded, or if the owner also publishes the commit to a public hub (H1).
+- "Nothing else involved" means no hub and no Hugging Face were asked. Both VMs had internet access and it was not blocked.
+- The key is read from a file by the host process; the signer process (`torrenthub signer`) is not used. Anyone who can read that file can sign as the owner.
+- A deleted branch is ignored: its last commit stays served. Removing a repo is not built.
+- Edits between two passes can be served for up to `--poll` seconds. Hardlinks also keep a deleted file's disk space until the link goes.
+- One repo per host process.
+- The host listens on every address by default (`--bind`).
+- Only the command line was exercised, on Linux.

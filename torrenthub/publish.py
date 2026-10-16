@@ -368,11 +368,7 @@ class Ingest:
 
     # ------------------------------------------------------------------ work
     def _put_small(self, x: str, data: bytes) -> None:
-        path = self.store.blob_path(x)
-        tmp = self.store.tmp_path(x)
-        tmp.write_bytes(data)
-        tmp.replace(path)
-        self.store.put_blob(BlobRow(x, len(data), x, "complete", None, None, time.time()))
+        self.store.put_small(x, data)
 
     async def _run(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict, work: GitWork | None = None) -> None:
         try:

@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -75,6 +75,19 @@ def add_event_commands(sub) -> None:
     sp.add_argument("--stage", help="folder for the staged big files (default: a temporary one next to the data dir)")
     sp.add_argument("--timeout", type=float, default=3600)
     sp.add_argument("--tracker", action="append", default=[])
+
+    sp = sub.add_parser("host", help="serve a repo straight from a git repository on this machine, signed with your key")
+    _key_args(sp)
+    sp.add_argument("--git", required=True, metavar="DIR", help="the git repository (its working tree or git-lfs cache holds the big files)")
+    sp.add_argument("--repo", required=True, help="owner/name under which it is served")
+    sp.add_argument("--public-url", required=True, help="the address other machines reach this host at, such as http://host.example:8080")
+    sp.add_argument("--branch", action="append", help="branch to serve (repeatable; default main)")
+    sp.add_argument("--files-from", action="append", default=[], metavar="DIR", help="another folder to look in for big files (by path or by sha256)")
+    sp.add_argument("--poll", type=float, default=10.0, help="seconds between looks at the branches and at the served files")
+    sp.add_argument("--valid-days", type=float, help="manifests stop being believed after this long; the host signs again at half of it")
+    sp.add_argument("--bind", default="0.0.0.0")
+    sp.add_argument("--port", type=int, default=8080)
+    sp.add_argument("--listen-port", type=int, default=6881, help="swarm port")
 
     sp = sub.add_parser("request", help="ask for work and wait for an answer you trust (judged by THUB_ROOTS, not by the hub)")
     _key_args(sp)
@@ -366,6 +379,26 @@ def run_event_command(args, settings, p) -> None:
             except (RuntimeError, ValueError) as e:
                 raise SystemExit(f"error: {e}")
             print(json.dumps({k: res.get(k) for k in ("state", "repo", "commit", "seconds", "already")}))
+        elif c == "host":
+            import dataclasses
+            import logging
+
+            import uvicorn
+
+            from .host import build_host_app
+            from .signing import public_key
+
+            logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+            secret = _secret(args, p)
+            pk = public_key(secret).hex()
+            s = dataclasses.replace(settings, public_url=args.public_url.rstrip("/"), roots=[pk], swarm="libtorrent",
+                                    listen_port=args.listen_port, webseed_upstream=False, lazy_mirror=False, anchor="",
+                                    upstream="http://127.0.0.1:9", publish_quota=0)
+            app, host = build_host_app(s, repo=args.repo, git_dir=Path(args.git), secret=secret, branches=tuple(args.branch or ["main"]),
+                                       extra_dirs=tuple(args.files_from), valid_for=args.valid_days * 86400 if args.valid_days else None, poll=args.poll)
+            print(json.dumps({"hosting": args.repo, "git": args.git, "pubkey": pk, "url": s.public_url, "branches": list(host.branches)}), flush=True)
+            print(f"consumers pin it with: THUB_TRUST='{args.repo}=signed:{pk}' THUB_UPSTREAM={s.public_url}", flush=True)
+            uvicorn.run(app, host=args.bind, port=args.port)
         elif c == "revoke":
             target = key(args.target) if args.kind == "key" else args.target
             succ = key(args.successor) if args.successor else None
