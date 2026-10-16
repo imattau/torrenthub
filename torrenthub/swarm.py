@@ -147,10 +147,15 @@ def resolve_peer(host: str, port: int) -> tuple[str, int] | None:
 
 
 def local_ipv4_addresses() -> list[str]:
-    """Every IPv4 address this machine has (Linux). Empty if they cannot be listed."""
-    import fcntl
+    """Every IPv4 address this machine has (Linux only; the ioctl is Linux's). Empty elsewhere or if they cannot be listed,
+    and the caller then listens on the wildcard address as before."""
     import socket
     import struct
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        return []
+    import fcntl
 
     out = []
     for _, name in socket.if_nameindex():

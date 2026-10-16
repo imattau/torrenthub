@@ -52,28 +52,29 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux is built inside a manylinux image (glibc 2.28), so it runs on Debian 10+, Ubuntu 20.04+, RHEL 8+ and newer.
-          - {name: linux-x86_64,   os: ubuntu-24.04,     container: "quay.io/pypa/manylinux_2_28_x86_64",  vpy: "venv/bin/python",         archive: tar.gz}
-          - {name: linux-arm64,    os: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_28_aarch64", vpy: "venv/bin/python",         archive: tar.gz}
-          - {name: windows-x86_64, os: windows-2022,     container: "",                                   vpy: "venv/Scripts/python.exe", archive: zip}
-          - {name: macos-arm64,    os: macos-14,         container: "",                                   vpy: "venv/bin/python",         archive: tar.gz}
-          - {name: macos-x86_64,   os: macos-15-intel,   container: "",                                   vpy: "venv/bin/python",         archive: tar.gz}
+          # Linux is built inside an AlmaLinux 8 image (glibc 2.28), so it runs on Debian 10+, Ubuntu 20.04+, RHEL 8+ and newer.
+          # (The manylinux images were tried first: their Python is static and PyInstaller needs a shared libpython.)
+          - {name: linux-x86_64,   os: ubuntu-24.04,     container: "almalinux:8", py: python3.12, vpy: "venv/bin/python",         archive: tar.gz}
+          - {name: linux-arm64,    os: ubuntu-24.04-arm, container: "almalinux:8", py: python3.12, vpy: "venv/bin/python",         archive: tar.gz}
+          - {name: windows-x86_64, os: windows-2022,     container: "",            py: python,     vpy: "venv/Scripts/python.exe", archive: zip}
+          - {name: macos-arm64,    os: macos-14,         container: "",            py: python,     vpy: "venv/bin/python",         archive: tar.gz}
+          - {name: macos-x86_64,   os: macos-15-intel,   container: "",            py: python,     vpy: "venv/bin/python",         archive: tar.gz}
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
     timeout-minutes: 45
     steps:
+      - name: Tools for the build image
+        if: matrix.container != ''
+        run: dnf install -y -q python3.12 python3.12-pip tar gzip git binutils findutils
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         if: matrix.container == ''
         with:
           python-version: "3.12"
-      - name: Python (manylinux image)
-        if: matrix.container != ''
-        run: echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
       - name: Install into a clean virtualenv
         shell: bash
         run: |
-          python -m venv venv
+          ${{ matrix.py }} -m venv venv
           ${{ matrix.vpy }} -m pip install --upgrade pip
           ${{ matrix.vpy }} -m pip install pyinstaller
           ${{ matrix.vpy }} -m pip install ".[all]"
