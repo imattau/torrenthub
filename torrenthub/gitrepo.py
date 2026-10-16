@@ -19,7 +19,10 @@ from __future__ import annotations
 
 import os
 import re
-import resource
+try:
+    import resource  # not on Windows: the file size limit below is then not applied
+except ImportError:  # pragma: no cover
+    resource = None
 import shutil
 import subprocess
 import tempfile
@@ -79,8 +82,9 @@ def run_git(args, *, cwd=None, stdin: bytes | None = None, timeout: float = 60.0
                 except OSError as e:
                     raise GitError(f"cannot run git: {e}") from e
                 try:
-                    resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, (fsize, fsize))
-                except (OSError, ProcessLookupError, ValueError):
+                    if resource is not None:
+                        resource.prlimit(proc.pid, resource.RLIMIT_FSIZE, (fsize, fsize))
+                except (OSError, ProcessLookupError, ValueError, AttributeError):
                     pass
                 try:
                     rc = proc.wait(timeout)

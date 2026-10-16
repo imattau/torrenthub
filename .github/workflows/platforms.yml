@@ -1,0 +1,41 @@
+# Does it run, and do the tests pass, on each operating system? Exploratory: every job reports and none stops the others.
+name: platforms
+on:
+  push:
+    branches: [platforms]
+  workflow_dispatch:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-24.04,     python: "3.12", name: linux-x86_64}
+          - {os: ubuntu-24.04,     python: "3.11", name: linux-x86_64-py311}
+          - {os: ubuntu-24.04-arm, python: "3.12", name: linux-arm64}
+          - {os: windows-2022,     python: "3.12", name: windows-x86_64}
+          - {os: macos-14,         python: "3.12", name: macos-arm64}
+          - {os: macos-15-intel,   python: "3.12", name: macos-x86_64}
+    name: test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -e ".[swarm,mcp,relay,fast,dev]"
+      - run: git config --global user.email ci@example.org && git config --global user.name ci
+      - run: git --version && python -c "import libtorrent, sys; print('libtorrent', libtorrent.__version__, sys.platform)"
+      - run: python -c "import torrenthub.app, torrenthub.cli, torrenthub.gitrepo; print('imports ok')"
+      - run: python -m pytest -q -p no:cacheprovider -rfE --junitxml=junit.xml -o junit_family=xunit1
+        continue-on-error: true
+        id: tests
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: junit-${{ matrix.name }}
+          path: junit.xml
+      - if: steps.tests.outcome == 'failure'
+        run: exit 1
