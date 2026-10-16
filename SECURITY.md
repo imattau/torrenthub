@@ -48,6 +48,10 @@ A client now joins a swarm to fetch a file or a history pack, so it announces it
 
 `GET /announce` is public and unauthenticated. It answers only for torrents the hub holds and has not blocked, records the address of the connection (never a claimed `ip=`), caps peers per torrent and torrents in all, expires entries, limits announces per address and bounds `numwant`. What it cannot prevent: someone announcing many fake ports from one address, which makes that address appear many times (capped per torrent); the hub learning which addresses download which torrents; a swarm of real peers being pointed at a victim by many announcers who each can only list themselves. Behind a reverse proxy the per-address limit and the recorded address depend on `FORWARDED_ALLOW_IPS`. Not reviewed: the tracker under load; whether an attacker can use it to learn the hub's blob list by guessing infohashes (it answers differently for unknown and known ones, as a tracker must).
 
+## The DHT (added with D2)
+
+A client or seeder with the DHT on announces which infohashes it holds and asks for others, to every node it reaches, and listens on UDP. With `dhtpublic` on (the default) that includes the public mainline DHT, where anyone can see which infohashes a machine asks for; `thub.dhtpublic=false` (and `THUB_DHT_PUBLIC=0` on the hub) keeps a swarm private. `dht_local` switches off libtorrent's checks that refuse private and loopback nodes and node ids that do not match an address; use it only on a private network. `thub.upnp` asks the home router to open a port. Not reviewed: libtorrent's DHT against hostile nodes; what port mapping exposes.
+
 ## Dependencies
 
 `pip-audit` (2026-10-16) found no known vulnerabilities in `lock/runtime.txt` (36 packages, everything a deployment installs) or `lock/dev.txt`. The earlier run's only findings were against `pip` 24.0 in a development environment, since upgraded.

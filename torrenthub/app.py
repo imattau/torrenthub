@@ -12,7 +12,7 @@ import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Callable
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urlsplit
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
@@ -365,7 +365,8 @@ def create_app(
 ) -> FastAPI:
     store = Store(settings.data_dir)
     upstream = upstream or make_upstream(settings)
-    swarm = swarm or make_swarm(settings.swarm, settings.listen_port, settings.peers, settings.outgoing_utp)
+    swarm = swarm or make_swarm(settings.swarm, settings.listen_port, settings.peers, settings.outgoing_utp, dht=settings.dht,
+                                dht_public=settings.dht_public, dht_local=settings.dht_local)
     metrics = Metrics()
     events = EventStore(settings.data_dir)
     # Keys named in `signed:` rules are roots too: naming a key there already pins it.
@@ -591,7 +592,8 @@ def create_app(
         """What a client needs to join this hub's swarm directly, besides trackers and DHT."""
         return {"swarm": {"enabled": bool(swarm.enabled), "port": settings.listen_port if swarm.enabled else None},
                 "public_url": settings.public_url, "trackers": list(settings.trackers),
-                "tracker": f"{settings.public_url}/announce" if settings.tracker and swarm.enabled else None}
+                "tracker": f"{settings.public_url}/announce" if settings.tracker and swarm.enabled else None,
+                "dht": {"host": urlsplit(settings.public_url).hostname, "port": settings.listen_port} if settings.dht and swarm.enabled else None}
 
     @app.get("/announce")
     async def announce(request: Request):

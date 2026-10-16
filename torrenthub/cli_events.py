@@ -470,15 +470,32 @@ def run_event_command(args, settings, p) -> None:
                         items.append((tp, f))
             cfg = clientswarm.config_from_env(gd)
 
+            infos = []
+            for hub in pointers.hubs_for(Path(args.dir)):
+                try:
+                    import httpx
+
+                    infos.append(httpx.get(f"{hub}/api/thub/info", timeout=10).json())
+                except Exception:  # noqa: BLE001
+                    continue
+            cfg.listen_port = args.listen_port
+            node_info = next((i for i in infos if i.get("dht")), None)
+
             async def go():
-                sw = LibtorrentSwarm(args.listen_port, dht=cfg.dht)
+                sw = clientswarm.swarm_for(cfg, node_info)
                 try:
                     for tp, f in items:
                         await sw.seed(tp, f.parent)
+                    if cfg.dht:
+                        await sw.dht_ready(10.0)
+                    sw.reannounce_all()
                     print(json.dumps({"seeding": len(items), "port": args.listen_port or sw.ses.listen_port(), "files": [f.name for _, f in items]}), flush=True)
                     if args.once:
                         return
-                    await asyncio.sleep(args.seconds) if args.seconds else await asyncio.Event().wait()
+                    end = time.monotonic() + args.seconds if args.seconds else None
+                    while end is None or time.monotonic() < end:
+                        await asyncio.sleep(60)
+                        sw.reannounce_all()
                 finally:
                     await sw.close()
 

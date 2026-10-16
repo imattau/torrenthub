@@ -146,6 +146,9 @@ class Settings:
     publish_git_timeout: float = 60.0  # per git command
     publish_git_history_max: int = 128 * 1024 * 1024  # a commit's whole history as one pack
     publish_allow_force: bool = False  # accept a manifest that moves a branch to a commit that does not descend from it
+    dht: bool = True  # this hub joins the DHT; clients are told its node so they can use it to bootstrap
+    dht_public: bool = True  # and also contacts the public bootstrap routers (off for a private swarm)
+    dht_local: bool = False  # accept private and loopback addresses in the DHT (private networks, tests)
     tracker: bool = True  # answer BitTorrent announces for the torrents this hub holds, at <public url>/announce
     tracker_interval: int = 600
     tracker_max_peers: int = 300
@@ -236,6 +239,9 @@ class Settings:
             publish_allow_force=_bool(e("THUB_PUBLISH_ALLOW_FORCE"), False),
             git_http_per_ip_per_minute=float(e("THUB_GIT_HTTP_PER_IP_MINUTE", "120")),
             git_http_max_body=parse_size(e("THUB_GIT_HTTP_MAX_BODY"), 4 * 1024 * 1024),
+            dht=_bool(e("THUB_DHT"), True),
+            dht_public=_bool(e("THUB_DHT_PUBLIC"), True),
+            dht_local=_bool(e("THUB_DHT_LOCAL"), False),
             tracker=_bool(e("THUB_TRACKER"), True),
             tracker_interval=int(e("THUB_TRACKER_INTERVAL", "600")),
             tracker_max_peers=int(e("THUB_TRACKER_MAX_PEERS", "300")),

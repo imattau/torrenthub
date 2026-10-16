@@ -37,6 +37,9 @@ class SwarmDownload:
     def cancel(self) -> None:
         """Stop downloading. Does not delete files."""
 
+    def nudge(self) -> None:
+        """Ask the trackers and the DHT again who has this torrent."""
+
 
 class Swarm:
     enabled = False
@@ -105,6 +108,47 @@ class _LtDownload(SwarmDownload):
         if self._h.is_valid():
             self._ses.remove_torrent(self._h)
 
+    def nudge(self) -> None:
+        if self._h.is_valid():
+            self._h.force_reannounce()
+            self._h.force_dht_announce()
+
+
+def free_port(host: str = "0.0.0.0") -> int:
+    """A port that is free for both TCP and UDP right now. libtorrent's DHT does not work when asked to listen on
+    port 0 (it cannot announce a port it was never told), so a session that wants "any port" picks one first."""
+    import socket
+
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as t:
+            t.bind((host, 0))
+            port = t.getsockname()[1]
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as u:
+                u.bind((host, port))
+            return port
+        except OSError:
+            continue
+    raise OSError("no free port found")
+
+
+def local_ipv4_addresses() -> list[str]:
+    """Every IPv4 address this machine has (Linux). Empty if they cannot be listed."""
+    import fcntl
+    import socket
+    import struct
+
+    out = []
+    for _, name in socket.if_nameindex():
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            out.append(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", name[:15].encode()))[20:24]))  # SIOCGIFADDR
+        except (OSError, ValueError):
+            pass
+        finally:
+            s.close()
+    return out
+
 
 class LibtorrentSwarm(Swarm):
     enabled = True
@@ -117,30 +161,51 @@ class LibtorrentSwarm(Swarm):
         dht: bool = True,
         upload_limit: int = 0,
         outgoing_utp: bool = False,
+        dht_nodes: list[tuple[str, int]] | None = None,
+        dht_public: bool = True,
+        dht_local: bool = False,
+        upnp: bool = False,
+        lsd: bool | None = None,
     ):
         import libtorrent as lt
 
         self.lt = lt
+        if listen_port == 0:
+            listen_port = free_port(listen_host)
+        listen = f"{listen_host}:{listen_port}"
+        if dht and listen_host in ("0.0.0.0", "") and (addrs := local_ipv4_addresses()):
+            # On a machine with more than one network interface a DHT node listening on the wildcard address gets no answers
+            # (found on the VMs: the same code, same hub, worked from a one-interface VM and not from a laptop with ethernet, wifi and a
+            # bridge). Listing the addresses one by one works.
+            listen = ",".join(f"{a}:{listen_port}" for a in addrs)
         # Static peer hints, for example sibling gateways. Useful when DHT and trackers
         # are unavailable (private deployments, tests).
         self.extra_peers = extra_peers or []
         settings = {
-            "listen_interfaces": f"{listen_host}:{listen_port}",
+            "listen_interfaces": listen,
             "enable_dht": dht,
-            "enable_lsd": dht,
-            "enable_upnp": False,
-            "enable_natpmp": False,
+            "enable_lsd": dht if lsd is None else lsd,  # local service discovery: multicast on the LAN, separate from the DHT
+            "enable_upnp": upnp,
+            "enable_natpmp": upnp,
             "allow_multiple_connections_per_ip": True,
             # libtorrent dials over uTP (UDP) first by default. Between two machines on a fast
             # link that measured about 20 MB/s against 350 MB/s over TCP, so dial TCP. Incoming
             # uTP stays on, so peers that prefer it can still reach us.
             "enable_outgoing_utp": outgoing_utp,
         }
+        if not dht_public:
+            settings["dht_bootstrap_nodes"] = ""  # do not contact the public bootstrap routers: a private swarm, or a test
+        if dht_local:
+            # libtorrent's DHT insists on node ids that match public addresses and ignores private ones. On a private
+            # network, or on one machine, that leaves nobody to talk to; these turn the checks off.
+            settings.update({"dht_restrict_routing_ips": False, "dht_restrict_search_ips": False, "dht_ignore_dark_internet": False})
         if upload_limit:
             settings["upload_rate_limit"] = upload_limit
             # Loopback counts as a local network, which libtorrent exempts from limits by default.
             settings["ignore_limits_on_local_network"] = False
         self.ses = lt.session(settings)
+        for host, port in dht_nodes or []:
+            self.ses.add_dht_node((host, port))
 
     def _hint_peers(self, handle) -> None:
         for host, port in self.extra_peers:
@@ -193,6 +258,22 @@ class LibtorrentSwarm(Swarm):
         self._hint_peers(handle)
         return _LtDownload(self.lt, self.ses, handle, atp.ti)
 
+    async def dht_ready(self, timeout: float = 5.0) -> bool:
+        """Wait until the DHT has at least one node in its table. A torrent added before that asks nobody, and
+        libtorrent does not ask again for a long while."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.ses.status().dht_nodes > 0:
+                return True
+            await asyncio.sleep(0.2)
+        return self.ses.status().dht_nodes > 0
+
+    def reannounce_all(self) -> None:
+        """Announce every torrent in the session to its trackers and the DHT again (a seeder does this now and then)."""
+        for h in self.ses.get_torrents():
+            h.force_reannounce()
+            h.force_dht_announce()
+
     async def stats(self) -> dict:
         torrents = self.ses.get_torrents()
         return {"torrents": len(torrents), "dht_nodes": self.ses.status().dht_nodes}
@@ -211,7 +292,9 @@ def parse_peers(items: list[str]) -> list[tuple[str, int]]:
     return peers
 
 
-def make_swarm(kind: str, listen_port: int, peers: list[str] | None = None, outgoing_utp: bool = False) -> Swarm:
+def make_swarm(kind: str, listen_port: int, peers: list[str] | None = None, outgoing_utp: bool = False, *, dht: bool = True,
+               dht_public: bool = True, dht_local: bool = False) -> Swarm:
     if kind == "libtorrent":
-        return LibtorrentSwarm(listen_port, extra_peers=parse_peers(peers or []), outgoing_utp=outgoing_utp)
+        return LibtorrentSwarm(listen_port, extra_peers=parse_peers(peers or []), outgoing_utp=outgoing_utp, dht=dht, dht_public=dht_public,
+                               dht_local=dht_local)
     return NullSwarm()

@@ -20,6 +20,11 @@ Configuration (git config first, then the environment):
   thub.tracker (repeatable) / THUB_TRACKERS   extra trackers
   thub.dht / THUB_CLIENT_DHT=0         turn DHT and local discovery off
   thub.webseed / THUB_CLIENT_WEBSEED=0 do not give libtorrent the hub's web seed (so only peers count)
+  thub.dhtnode (repeatable) / THUB_DHT_NODES  DHT nodes to bootstrap from; thub.hubdht / THUB_CLIENT_HUBDHT=0 ignore the hub's own
+  thub.dhtpublic / THUB_CLIENT_DHT_PUBLIC=0   do not use the public bootstrap routers; thub.dhtlocal / THUB_CLIENT_DHT_LOCAL=1 accept private DHT nodes
+  thub.listenHost / THUB_CLIENT_LISTEN_HOST   address to listen on (default 0.0.0.0)
+  thub.lsd / THUB_CLIENT_LSD=0         turn off local service discovery (multicast on the LAN); by default it follows thub.dht
+  thub.upnp / THUB_CLIENT_UPNP=1       ask the router to forward the listen port (UPnP, NAT-PMP)
   thub.hubpeer / THUB_CLIENT_HUBPEER=0 do not offer the hub's swarm port as a direct peer (so trackers, DHT and hints do the finding)
   thub.swarmTimeout, thub.swarmStall / THUB_CLIENT_TIMEOUT, THUB_CLIENT_STALL   seconds
 """
@@ -51,10 +56,17 @@ class SwarmConfig:
     trackers: list = field(default_factory=list)
     dht: bool = True
     webseed: bool = True
+    dht_nodes: list = field(default_factory=list)  # (host, port) of DHT nodes to bootstrap from, besides the hub's
+    dht_public: bool = True  # also use the public bootstrap routers
+    dht_local: bool = False  # accept private and loopback DHT nodes
+    upnp: bool = False  # ask the router to forward the listen port (UPnP and NAT-PMP)
+    hubdht: bool = True  # bootstrap from the hub's own DHT node
+    lsd: bool | None = None  # local service discovery (multicast on the LAN); None follows dht
     hubpeer: bool = True  # offer the hub's own swarm port as a peer; off, only trackers, DHT and hints find peers
     timeout: float = 3600.0
     stall: float = 30.0
     listen_port: int = 0
+    listen_host: str = "0.0.0.0"
 
 
 def _git_values(key: str, cwd=None) -> list[str]:
@@ -68,6 +80,14 @@ def _flag(git_key: str, env_key: str, default: bool, cwd=None) -> bool:
         return env.strip().lower() not in ("0", "false", "no", "off")
     vals = _git_values(git_key, cwd)
     return vals[-1].strip().lower() not in ("0", "false", "no", "off") if vals else default
+
+
+def _lsd(cwd) -> bool | None:
+    env = os.environ.get("THUB_CLIENT_LSD")
+    if env is not None:
+        return env.strip().lower() not in ("0", "false", "no", "off")
+    vals = _git_values("thub.lsd", cwd)
+    return vals[-1].strip().lower() not in ("0", "false", "no", "off") if vals else None
 
 
 def parse_peers(items) -> list[tuple[str, int]]:
@@ -86,7 +106,11 @@ def config_from_env(cwd=None) -> SwarmConfig:
     return SwarmConfig(enabled=_flag("thub.swarm", "THUB_CLIENT_SWARM", True, cwd), peers=parse_peers(peers), trackers=trackers,
                        dht=_flag("thub.dht", "THUB_CLIENT_DHT", True, cwd), webseed=_flag("thub.webseed", "THUB_CLIENT_WEBSEED", True, cwd),
                        hubpeer=_flag("thub.hubpeer", "THUB_CLIENT_HUBPEER", True, cwd),
-                       timeout=num("thub.swarmTimeout", "THUB_CLIENT_TIMEOUT", "3600"), stall=num("thub.swarmStall", "THUB_CLIENT_STALL", "30"))
+                       hubdht=_flag("thub.hubdht", "THUB_CLIENT_HUBDHT", True, cwd), dht_public=_flag("thub.dhtpublic", "THUB_CLIENT_DHT_PUBLIC", True, cwd),
+                       dht_local=_flag("thub.dhtlocal", "THUB_CLIENT_DHT_LOCAL", False, cwd), lsd=_lsd(cwd), upnp=_flag("thub.upnp", "THUB_CLIENT_UPNP", False, cwd),
+                       dht_nodes=parse_peers(_git_values("thub.dhtnode", cwd) + os.environ.get("THUB_DHT_NODES", "").replace(",", " ").split()),
+                       timeout=num("thub.swarmTimeout", "THUB_CLIENT_TIMEOUT", "3600"), stall=num("thub.swarmStall", "THUB_CLIENT_STALL", "30"),
+                       listen_host=(os.environ.get("THUB_CLIENT_LISTEN_HOST") or (_git_values("thub.listenHost", cwd) or ["0.0.0.0"])[-1]))
 
 
 def _say(msg: str) -> None:
@@ -122,8 +146,6 @@ def fetch_blob(hub: str, key: str, size: int, dest: Path, work: Path, *, infohas
 
 
 async def _via_swarm(hub, key, size, dest, work, infohash, cfg, keep_torrent, say) -> dict | None:
-    from .swarm import LibtorrentSwarm
-
     with httpx.Client(timeout=30, follow_redirects=True) as c:
         r = c.get(f"{hub}/torrents/{key}.torrent")
         if r.status_code != 200:
@@ -146,17 +168,22 @@ async def _via_swarm(hub, key, size, dest, work, infohash, cfg, keep_torrent, sa
     torrent.write_bytes(sanitize_torrent(raw, trackers, [f"{hub}/blobs/{key}"] if cfg.webseed else []))
     target = work / key
     target.unlink(missing_ok=True)
-    swarm = LibtorrentSwarm(cfg.listen_port, extra_peers=peers, dht=cfg.dht)
+    swarm = swarm_for(cfg, info, peers)
     try:
+        if cfg.dht:
+            await swarm.dht_ready(5.0)
         dl = await swarm.start(torrent, work)
         say(f"fetching {key[:12]} ({size:,} bytes) from the swarm: {len(peers)} peer hint(s), {len(trackers)} tracker(s)")
-        start = last_move = time.monotonic()
+        start = last_move = last_nudge = time.monotonic()
         seen = -1
         while not dl.complete():
             snap = dl.snapshot()
             if snap.get("done", 0) != seen:
                 seen, last_move = snap.get("done", 0), time.monotonic()
             now = time.monotonic()
+            if now - last_move > 5 and now - last_nudge > 5 and dl.peers() == 0:
+                dl.nudge()  # nobody yet: ask the trackers and the DHT again
+                last_nudge = now
             if now - last_move > cfg.stall or now - start > cfg.timeout:
                 dl.cancel()
                 say(f"nothing arrived from the swarm for {cfg.stall:.0f}s; asking the hub over HTTP")
@@ -176,6 +203,19 @@ async def _via_swarm(hub, key, size, dest, work, infohash, cfg, keep_torrent, sa
         return {"via": "swarm", "seconds": round(time.monotonic() - start, 1), "peers": dl.peers()}
     finally:
         await swarm.close()
+
+
+def swarm_for(cfg: SwarmConfig, info: dict | None = None, peers: list | None = None):
+    """A libtorrent session set up from the client's configuration. The hub's DHT node (from /api/thub/info) is
+    added to the routing table, so with the tracker off the hub is still somewhere to start looking from."""
+    from .swarm import LibtorrentSwarm
+
+    nodes = list(cfg.dht_nodes)
+    d = (info or {}).get("dht")
+    if cfg.dht and cfg.hubdht and isinstance(d, dict) and d.get("host") and d.get("port"):
+        nodes.append((d["host"], int(d["port"])))
+    return LibtorrentSwarm(cfg.listen_port, cfg.listen_host, extra_peers=list(cfg.peers) if peers is None else peers, dht=cfg.dht, dht_nodes=nodes if cfg.dht else [], dht_public=cfg.dht_public,
+                           dht_local=cfg.dht_local, upnp=cfg.upnp, lsd=cfg.lsd)
 
 
 def _trackers_of(raw: bytes) -> list[str]:
