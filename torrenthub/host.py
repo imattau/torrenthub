@@ -28,6 +28,8 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -121,6 +123,7 @@ class Host:
             self._derived.clear()  # only the heads in use are worth keeping
             self._derived[head] = d
         await self._ensure_files(d)
+        await asyncio.to_thread(self._mirror_git, head, names)
         todo = [b for b in names if cur[b] is None or cur[b]["commit"] != head or due[b]]
         results = []
         if todo:
@@ -191,6 +194,29 @@ class Host:
         self.store.set_source(self.repo, head, "signed")
         self.store.add_manifest(ev)
         return seq
+
+    def _mirror_git(self, head: str, branches: list[str]) -> None:
+        """Copy the history of the served commit into the hub's own bare repository and point the
+        branches at it. That repository is what plain `git clone https://...` is served from, so it
+        holds exactly what is served: the owner's other branches and unpublished work are never in it."""
+        s = self.settings
+        perm = self.store.git_repo_path(self.repo)
+        have_here = perm.exists() and gitrepo.object_type(perm, head) == "commit"
+        if not have_here:
+            known = []
+            if perm.exists():
+                known = [c for c in (gitrepo.run_git(["for-each-ref", "--format=%(objectname)", "refs/heads"], cwd=perm, sandbox=True)[1].decode().split())
+                         if gitrepo.local_has(self.git_dir, c)]
+            pack = gitrepo.make_pack(self.git_dir, head, known, fsize=s.serve_git_max_pack * 2, timeout=600.0)
+            tmp = Path(tempfile.mkdtemp(prefix="git-", dir=self.store.root / "tmp"))
+            try:
+                gitrepo.init_bare(tmp, perm if perm.exists() else None)
+                sha = gitrepo.index_pack(tmp, pack, max_pack=s.serve_git_max_pack * 2, timeout=600.0)
+                gitrepo.adopt(tmp, perm, sha)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+        for b in branches:
+            gitrepo.update_ref(perm, b, head)
 
     # ------------------------------------------------------------------ big files, in place
     async def _ensure_files(self, d: gitrepo.Derived) -> None:

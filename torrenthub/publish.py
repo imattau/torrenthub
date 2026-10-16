@@ -210,7 +210,7 @@ class Ingest:
 
     # ------------------------------------------------------------------ git
     def _perm_repo(self, repo: str) -> Path:
-        return self.store.root / "git" / (repo.replace("/", "__") + ".git")
+        return self.store.git_repo_path(repo)
 
     async def _check_git(self, m: Manifest, body: dict) -> GitWork:
         s = self.s
@@ -293,6 +293,20 @@ class Ingest:
             raise PublishError(404, "RepoNotFound", f"{repo} has no git history here")
         async with self._git_slots:
             return await asyncio.to_thread(self._pack, src, want, have, heads)
+
+    async def smart_http(self, repo: str, body: bytes | None, *, advertise: bool, git_protocol: str | None) -> bytes:
+        """The read-only smart HTTP transport, so stock `git clone https://hub/owner/name` works. Only
+        the hub's own repository is used: for a hosted repo that holds the served branches and
+        nothing else (host.py copies them in), so a private branch cannot be asked for."""
+        src = self.git_source(repo)
+        if src is None or not self.git_refs(repo):
+            raise PublishError(404, "RepoNotFound", f"{repo} has no git history here")
+        async with self._git_slots:
+            try:
+                return await asyncio.to_thread(gitrepo.upload_pack, src, body, advertise=advertise, git_protocol=git_protocol,
+                                               fsize=self.s.serve_git_max_pack, timeout=self.s.publish_git_timeout * 4)
+            except gitrepo.GitError as e:
+                raise PublishError(500, "GitFailed", str(e)) from None
 
     def _pack(self, src: Path, want: str, have: list, heads: set) -> bytes:
         try:

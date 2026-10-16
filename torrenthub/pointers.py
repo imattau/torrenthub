@@ -201,20 +201,60 @@ def materialize(repo_dir: Path, hubs: list[str] | None = None) -> list[str]:
     return done
 
 
-def install(repo_dir: Path, patterns=DEFAULT_PATTERNS, command: str = "torrenthub") -> dict:
-    """Set the filter up in a repository and say which patterns it covers."""
+HOOK_MARK = "# torrenthub: pre-push"
+HOOK = f"""#!/bin/sh
+{HOOK_MARK}
+# git-lfs would upload LFS objects to the remote; a thub remote takes big files through git-remote-thub instead.
+case "$2" in
+  thub::*|thub://*) exit 0 ;;
+esac
+command -v git-lfs >/dev/null 2>&1 || exit 0
+exec git lfs pre-push "$@"
+"""
+
+
+def _pre_push_hook(repo_dir: Path) -> list[str]:
+    path = Path(_git(["rev-parse", "--git-path", "hooks/pre-push"], repo_dir))
+    path = path if path.is_absolute() else Path(repo_dir) / path
+    if path.exists():
+        old = path.read_text(errors="replace")
+        if HOOK_MARK in old:
+            return []
+        if "git lfs pre-push" in old and len(old) < 600:  # git-lfs's own: ours does the same for every remote but a thub one
+            path.rename(path.with_name("pre-push.thub-backup"))
+        else:
+            return [f"{path} is a hook of your own: it will run for pushes to a thub remote too. If it calls git lfs pre-push, skip that for thub:: URLs"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(HOOK)
+    path.chmod(0o755)
+    return []
+
+
+def install(repo_dir: Path, patterns=DEFAULT_PATTERNS, command: str = "torrenthub", lfs: bool = False) -> dict:
+    """Set the filter up in a repository and say which patterns it covers. With `lfs`, write the
+    attributes git-lfs expects (and set nothing up here): a stock git-lfs then handles the files, and
+    a hub's LFS endpoint serves them to a plain `git clone`."""
     repo_dir = Path(repo_dir)
     gd = git_dir(repo_dir)  # raises if this is not a repository
-    for k, v in (("clean", f"{command} filter clean"), ("smudge", f"{command} filter smudge"), ("required", "true")):
-        subprocess.run(["git", "config", f"filter.thub.{k}", v], cwd=repo_dir, check=True)
+    warnings = []
+    if not lfs:
+        for k, v in (("clean", f"{command} filter clean"), ("smudge", f"{command} filter smudge"), ("required", "true")):
+            subprocess.run(["git", "config", f"filter.thub.{k}", v], cwd=repo_dir, check=True)
+    else:
+        # What `git lfs install --local` sets for the filters, and our own pre-push hook. git-lfs installs a pre-push
+        # hook the first time its filter runs, and that hook uploads LFS objects to the remote, which fails against a
+        # thub remote (a hub takes big files through git-remote-thub). A hook that is already there is not overwritten.
+        for k, v in (("clean", "git-lfs clean -- %f"), ("smudge", "git-lfs smudge -- %f"), ("process", "git-lfs filter-process"), ("required", "true")):
+            subprocess.run(["git", "config", f"filter.lfs.{k}", v], cwd=repo_dir, check=True)
+        warnings += _pre_push_hook(repo_dir)
     ga = repo_dir / ".gitattributes"
     have = ga.read_text().splitlines() if ga.exists() else []
     added = []
     for pat in patterns:
-        line = f"{pat} filter=thub -text"
+        line = f"{pat} filter=lfs diff=lfs merge=lfs -text" if lfs else f"{pat} filter=thub -text"
         if line not in have:
             have.append(line)
             added.append(pat)
     if added:
         ga.write_text("\n".join(have) + "\n")
-    return {"git_dir": str(gd), "added": added}
+    return {"git_dir": str(gd), "added": added, "warnings": warnings}

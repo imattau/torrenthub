@@ -280,6 +280,54 @@ class Helper:
         return pub.commit
 
 
+def verify_clone(repo_dir: Path, signers: list[str] | None = None, hub_url: str | None = None) -> dict:
+    """Check a clone made with stock git (`git clone https://hub/owner/name`) against signed manifests.
+
+    Stock git trusts the hub's word about what a branch holds. This asks the hub for its manifests,
+    keeps those signed by the pinned keys, and compares each signed branch with the clone's own: the
+    commit must be the signed one, and the file table derived from its tree must be the signed table.
+    Returns {"ok", "branches": {name: {"state", "signed", "local"}}}; state is verified, not_fetched
+    (the signed commit is not in this clone yet: fetch, then check again), ahead (the clone has commits
+    nobody signed on top of the signed one), different, or missing."""
+    from .signing import parse_pubkey
+
+    repo_dir = Path(repo_dir)
+    top = _git(["rev-parse", "--absolute-git-dir"], cwd=repo_dir)
+    if not top:
+        raise RemoteError(f"{repo_dir} is not a git repository")
+    gd = Path(top)
+    url = hub_url or _git(["config", "--get", "remote.origin.url"], cwd=repo_dir)
+    if url.startswith("thub::"):
+        url = url[len("thub::"):]
+    h = Helper("origin", url)
+    h.git_dir = gd
+    pins = {parse_pubkey(k) for k in (signers or [])}
+    cfg = {parse_pubkey(k) for k in _git_all_in("thub.signer", repo_dir)}
+    h.signers |= pins | cfg
+    out = {}
+    for branch, (commit, m) in h.signed_refs().items():
+        local = _git(["rev-parse", "-q", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo_dir) or _git(["rev-parse", "-q", "--verify", f"refs/heads/{branch}"], cwd=repo_dir)
+        if not local:
+            out[branch] = {"state": "missing", "signed": commit, "local": None}
+        elif local == commit:
+            d = gitrepo.derive(gd, commit, blob_max=64 << 20, small_total=256 << 20, max_files=100_000, sandbox=True)
+            ok = d.rows == tuple(m.rows) and d.tree == m.git["tree"]
+            out[branch] = {"state": "verified" if ok else "different", "signed": commit, "local": local}
+        elif gitrepo.object_type(gd, commit) != "commit":
+            # The clone does not have the signed commit, so it cannot say whether it is merely behind or has diverged.
+            out[branch] = {"state": "not_fetched", "signed": commit, "local": local,
+                           "note": "the signed commit is not in this clone: run git fetch and check again; if it never arrives, the hub is not serving the signed history"}
+        elif gitrepo.run_git(["merge-base", "--is-ancestor", commit, local], cwd=gd, sandbox=True, ok=(0, 1, 128))[0] == 0:
+            out[branch] = {"state": "ahead", "signed": commit, "local": local}
+        else:
+            out[branch] = {"state": "different", "signed": commit, "local": local}
+    return {"hub": h.hub, "repo": h.repo, "ok": bool(out) and all(v["state"] == "verified" for v in out.values()), "branches": out}
+
+
+def _git_all_in(key: str, cwd) -> list[str]:
+    return [v for v in _git(["config", "--get-all", key], cwd=cwd).splitlines() if v]
+
+
 def _oneline(e) -> str:
     return " ".join(str(e).split()).replace('"', "'")[:300]
 

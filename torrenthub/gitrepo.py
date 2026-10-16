@@ -57,7 +57,7 @@ def safe_path(p) -> bool:
 # ------------------------------------------------------------------ running git
 
 def run_git(args, *, cwd=None, stdin: bytes | None = None, timeout: float = 60.0, fsize: int = 64 << 20,
-            sandbox: bool = False, ok=(0,)) -> tuple[int, bytes, bytes]:
+            sandbox: bool = False, ok=(0,), extra_env: dict | None = None) -> tuple[int, bytes, bytes]:
     """Run git and return (exit code, stdout, stderr). Output goes to files so a chatty or stuck
     process cannot block us; `fsize` is the most any file git writes (output included) may reach."""
     with tempfile.TemporaryDirectory(prefix="thub-git-") as td:
@@ -66,7 +66,7 @@ def run_git(args, *, cwd=None, stdin: bytes | None = None, timeout: float = 60.0
         if sandbox:
             env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(td), "GIT_CONFIG_NOSYSTEM": "1",
                    "GIT_CONFIG_GLOBAL": os.devnull, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1",
-                   "GIT_ATTR_NOSYSTEM": "1", "LC_ALL": "C"}
+                   "GIT_ATTR_NOSYSTEM": "1", "LC_ALL": "C", **(extra_env or {})}
         stdin_f = None
         if stdin is not None:
             (td / "in").write_bytes(stdin)
@@ -297,6 +297,28 @@ def update_ref(perm_repo: Path, ref: str, head: str) -> None:
     if not valid_ref(ref) or not SHA40.fullmatch(head):
         raise GitError("bad ref")
     run_git(["update-ref", f"refs/heads/{ref}", head], cwd=perm_repo, sandbox=True)
+    rc, _, _ = run_git(["rev-parse", "-q", "--verify", "HEAD"], cwd=perm_repo, sandbox=True, ok=(0, 1))
+    if rc != 0:  # HEAD names a branch that does not exist (yet): make it the first one, so a clone has something to check out
+        run_git(["symbolic-ref", "HEAD", f"refs/heads/{ref}"], cwd=perm_repo, sandbox=True)
+
+
+PROTOCOL = re.compile(r"(?:^|:)version=([0-2])(?::|$)")
+
+
+def upload_pack(repo: Path, body: bytes | None, *, advertise: bool, git_protocol: str | None, fsize: int, timeout: float) -> bytes:
+    """What `git-upload-pack --stateless-rpc` says for smart HTTP: the advertisement of refs, or the
+    answer to a request. Runs in the same sandbox as everything else the hub does with git."""
+    m = PROTOCOL.search(git_protocol or "")
+    extra = {"GIT_PROTOCOL": f"version={m.group(1)}"} if m else {}
+    args = ["-c", "uploadpack.allowFilter=false", "-c", "uploadpack.allowAnySHA1InWant=false", "-c", "uploadpack.allowRefInWant=false",
+            "upload-pack", "--stateless-rpc", "--strict", f"--timeout={max(1, int(timeout))}"]
+    if advertise:
+        args.append("--advertise-refs")
+    args.append(str(repo))
+    _, out, _ = run_git(args, stdin=None if advertise else body, timeout=timeout, fsize=fsize, sandbox=True, extra_env=extra)
+    if advertise and not (m and m.group(1) == "2"):
+        out = b"001e# service=git-upload-pack\n0000" + out
+    return out
 
 
 # ------------------------------------------------------------------ the publisher's side

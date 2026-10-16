@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "filter", "git-init", "pull-files", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
+EVENT_COMMANDS = {"identity", "delegate", "endorse", "revoke", "derive", "lineage", "publish", "host", "filter", "git-init", "pull-files", "verify-git", "request", "requests", "work", "relay-info", "relay-check", "relay-push", "relay-pull", "events-add", "events-pull", "events-sync", "events", "trust",
                   "verify-blobs", "replicate", "signer", "verdict"}
 
 
@@ -96,6 +96,12 @@ def add_event_commands(sub) -> None:
     sp = sub.add_parser("git-init", help="set up the big-file filter in this git repository and write .gitattributes, so git add makes pointers without git-lfs")
     sp.add_argument("--pattern", action="append", help="file pattern to treat as big (repeatable; default: common model formats)")
     sp.add_argument("--dir", default=".")
+    sp.add_argument("--lfs", action="store_true", help="write git-lfs's attributes instead and use stock git-lfs (install it with git lfs install); hubs then serve the files to a plain git clone")
+
+    sp = sub.add_parser("verify-git", help="check a clone made with stock git against the signed manifests of the owner's key (stock git trusts the hub; this does not)")
+    sp.add_argument("--dir", default=".")
+    sp.add_argument("--signer", action="append", default=[], help="the owner's public key (hex or npub), repeatable; also thub.signer and THUB_SIGNERS")
+    sp.add_argument("--hub", help="URL of the repo on the hub (default: remote.origin.url)")
 
     sp = sub.add_parser("pull-files", help="replace the pointer files in this working tree by the files they name, fetched from the hub of a thub remote")
     sp.add_argument("--dir", default=".")
@@ -428,11 +434,21 @@ def run_event_command(args, settings, p) -> None:
             from . import pointers
 
             try:
-                out = pointers.install(Path(args.dir), tuple(args.pattern) if args.pattern else pointers.DEFAULT_PATTERNS)
+                out = pointers.install(Path(args.dir), tuple(args.pattern) if args.pattern else pointers.DEFAULT_PATTERNS, lfs=args.lfs)
             except Exception as e:  # noqa: BLE001
                 raise SystemExit(f"error: {e}")
             print(json.dumps(out))
             print("big files matching those patterns now become pointers when added, and are fetched when checked out", file=sys.stderr)
+        elif c == "verify-git":
+            from .gitremote import RemoteError, verify_clone
+
+            try:
+                res = verify_clone(Path(args.dir), [*args.signer, *[k for k in os.environ.get("THUB_SIGNERS", "").replace(",", " ").split() if k]], args.hub)
+            except (RemoteError, ValueError, Exception) as e:  # noqa: BLE001
+                raise SystemExit(f"error: {e}")
+            print(json.dumps(res, indent=1))
+            if not res["ok"]:
+                raise SystemExit(1)
         elif c == "pull-files":
             from . import pointers
 

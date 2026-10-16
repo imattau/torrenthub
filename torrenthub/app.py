@@ -7,6 +7,7 @@ import fnmatch
 import hashlib
 import json
 import mimetypes
+import re
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -237,6 +238,26 @@ class _TooLarge(Exception):
     pass
 
 
+def gunzip_bounded(data: bytes, limit: int) -> bytes:
+    """Git compresses a large request. Inflate it, but never past `limit` bytes."""
+    import zlib
+
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        out = d.decompress(data, limit + 1)
+    except zlib.error:
+        raise HubError(400, "BadRequest", "the request body is not valid gzip") from None
+    if len(out) > limit or d.unconsumed_tail:
+        raise HubError(413, "TooLarge", f"the request is over {limit} bytes once decompressed")
+    return out
+
+
+def _path_matches(rule: str, path: str) -> bool:
+    """A rule is a path prefix, or, starting with "*", a path suffix (the git endpoints live under
+    /<owner>/<name>, so they have no common prefix)."""
+    return path.endswith(rule[1:]) if rule.startswith("*") else path.startswith(rule)
+
+
 class BodyLimit:
     """Refuse a request body over the limit for its path before it is read into memory.
 
@@ -251,7 +272,7 @@ class BodyLimit:
     async def __call__(self, scope, receive, send):
         limit = None
         if scope["type"] == "http" and scope["method"] in ("POST", "PUT", "PATCH"):
-            limit = next((n for prefix, n in self.limits.items() if scope["path"].startswith(prefix)), None)
+            limit = next((n for prefix, n in self.limits.items() if _path_matches(prefix, scope["path"])), None)
         if limit is None:
             return await self.app(scope, receive, send)
         declared = next((v for k, v in scope["headers"] if k == b"content-length"), None)
@@ -309,8 +330,9 @@ class RateLimit:
 
     async def __call__(self, scope, receive, send):
         rule = None
-        if scope["type"] == "http" and scope["method"] == "POST":
-            rule = next(((p, r) for p, r in self.rules.items() if scope["path"].startswith(p) and r[1] > 0), None)
+        if scope["type"] == "http":
+            rule = next(((p, r) for p, r in self.rules.items()
+                         if _path_matches(p, scope["path"]) and r[1] > 0 and (scope["method"] == "POST" or p.startswith("*"))), None)
         if rule is None:
             return await self.app(scope, receive, send)
         prefix, (burst, per_minute) = rule
@@ -386,12 +408,15 @@ def create_app(
         await upstream.aclose()
 
     app = FastAPI(title="torrenthub", lifespan=lifespan)
-    app.add_middleware(BodyLimit, limits={"/api/thub/events": settings.max_event_body, "/api/thub/publish": settings.publish_max_body, "/api/thub/git/": 64 * 1024})
+    app.add_middleware(BodyLimit, limits={"/api/thub/events": settings.max_event_body, "/api/thub/publish": settings.publish_max_body, "/api/thub/git/": 64 * 1024, "*/git-upload-pack": settings.git_http_max_body, "*/info/lfs/objects/batch": 1024 * 1024})
     # added last, so it runs first: a flooding address is turned away before anything else looks at the request
     app.add_middleware(RateLimit, rules={
         "/api/thub/events": (settings.events_per_ip_burst, settings.events_per_ip_per_minute),
         "/api/thub/publish": (10, settings.publish_per_ip_per_minute),
-        "/api/thub/git/": (20, settings.git_pack_per_ip_per_minute)})
+        "/api/thub/git/": (20, settings.git_pack_per_ip_per_minute),
+        "*/git-upload-pack": (30, settings.git_http_per_ip_per_minute),
+        "*/info/refs": (30, settings.git_http_per_ip_per_minute),
+        "*/info/lfs/objects/batch": (30, settings.git_http_per_ip_per_minute)})
     app.state.mirror = mirror
     app.state.ingest = ingest
     app.state.store = store
@@ -583,6 +608,72 @@ def create_app(
             raise HubError(e.status, e.code, e.message) from None
         metrics.inc("thub_git_pack_total")
         return Response(pack, media_type="application/x-git-packed-objects")
+
+    # ---- plain git over HTTP, read only (HOSTING.md, H4). Git asks for <url>/info/refs and <url>/git-upload-pack;
+    # a URL ending in .git is the same repository. These serve the hub's own bare repository.
+    def git_repo_of(owner: str, name: str) -> str:
+        repo = f"{owner}/{name.removesuffix('.git')}"
+        if not REPO_NAME.fullmatch(repo):
+            raise HubError(400, "BadRequest", "not a repo id")
+        return repo
+
+    git_headers = {"Cache-Control": "no-cache, max-age=0, must-revalidate", "Pragma": "no-cache"}
+
+    @app.get("/{owner}/{name}/info/refs")
+    async def git_info_refs(owner: str, name: str, request: Request, service: str = ""):
+        if service != "git-upload-pack":
+            raise HubError(403, "ReadOnly", "this hub serves git for reading only; publish with torrenthub publish or git push through git-remote-thub")
+        repo = git_repo_of(owner, name)
+        try:
+            out = await ingest.smart_http(repo, None, advertise=True, git_protocol=request.headers.get("git-protocol"))
+        except PublishError as e:
+            raise HubError(e.status, e.code, e.message) from None
+        metrics.inc("thub_git_http_total", kind="refs")
+        return Response(out, media_type="application/x-git-upload-pack-advertisement", headers=git_headers)
+
+    @app.post("/{owner}/{name}/git-upload-pack")
+    async def git_upload_pack(owner: str, name: str, request: Request):
+        repo = git_repo_of(owner, name)
+        body = await request.body()
+        if request.headers.get("content-encoding", "").lower() in ("gzip", "x-gzip"):
+            body = gunzip_bounded(body, settings.git_http_max_body)
+        try:
+            out = await ingest.smart_http(repo, body, advertise=False, git_protocol=request.headers.get("git-protocol"))
+        except PublishError as e:
+            raise HubError(e.status, e.code, e.message) from None
+        metrics.inc("thub_git_http_total", kind="upload-pack")
+        return Response(out, media_type="application/x-git-upload-pack-result", headers=git_headers)
+
+    @app.post("/{owner}/{name}/info/lfs/objects/batch")
+    async def lfs_batch(owner: str, name: str, request: Request):
+        """The git-lfs batch API, download only: a stock git-lfs clone gets the big files of a served repo.
+        Each object is a link to /blobs/<sha256>, which hashes nothing new: git-lfs checks the sha256 itself."""
+        repo = git_repo_of(owner, name)
+        lfs = {"Content-Type": "application/vnd.git-lfs+json"}
+        try:
+            body = await request.json()
+            op, objs = body["operation"], body["objects"]
+            if not isinstance(objs, list) or len(objs) > 1000:
+                raise ValueError
+        except (ValueError, KeyError, TypeError, RecursionError):
+            return JSONResponse({"message": "not a git-lfs batch request"}, status_code=422, headers=lfs)
+        if op != "download":
+            return JSONResponse({"message": "this hub takes big files only through torrenthub publish or git push (git-remote-thub); git lfs push is not supported"},
+                                status_code=403, headers=lfs)
+        out = []
+        for o in objs:
+            oid, size = (o.get("oid"), o.get("size")) if isinstance(o, dict) else (None, None)
+            if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{64}", oid):
+                out.append({"oid": str(oid)[:80], "size": size if isinstance(size, int) else 0, "error": {"code": 422, "message": "not a sha256"}})
+            elif not store.repo_has_blob(repo, oid) or store.is_blocked(oid):
+                out.append({"oid": oid, "size": size, "error": {"code": 404, "message": "this repository has no such object"}})
+            elif not store.blob_complete(oid):
+                out.append({"oid": oid, "size": size, "error": {"code": 404, "message": "the object is not on this hub right now"}})
+            else:
+                out.append({"oid": oid, "size": store.get_blob(oid).size, "authenticated": True,
+                            "actions": {"download": {"href": f"{settings.public_url}/blobs/{oid}"}}})
+        metrics.inc("thub_git_http_total", kind="lfs-batch")
+        return JSONResponse({"transfer": "basic", "objects": out, "hash_algo": "sha256"}, headers=lfs)
 
     @app.get("/api/thub/publish/{job_id}")
     async def publish_status(job_id: str):

@@ -281,6 +281,15 @@ class Store:
         with self._lock:
             return int(self._db.execute("SELECT COUNT(*) AS n FROM blobs WHERE state='complete'").fetchone()["n"])
 
+    def git_repo_path(self, repo_id: str) -> Path:
+        """The bare git repository the hub keeps for a published or hosted repo."""
+        self._manifest_dir(repo_id)  # validates the name
+        return self.root / "git" / (repo_id.replace("/", "__") + ".git")
+
+    def repo_has_blob(self, repo_id: str, key: str) -> bool:
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM files WHERE repo_id=? AND blob_key=? LIMIT 1", (repo_id, key)).fetchone() is not None
+
     # published repos: content that exists nowhere else, so it is never evicted and never re-asked of an upstream
     def mark_published(self, repo_id: str, signer: str) -> None:
         with self._lock, self._db:

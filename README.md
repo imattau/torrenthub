@@ -255,6 +255,18 @@ git clone -c thub.signer=<owner key> -c filter.thub.clean="torrenthub filter cle
 
 A clone only follows branches that a manifest signed by a pinned key vouches for, and checks the commit and its file table against that manifest; the hub is not trusted. Without the filter options a clone has pointers in place of big files; `torrenthub pull-files` fills them in. `THUB_SKIP_SMUDGE=1` does the same during checkout. Use `thub::http://host:port/you/model` for a hub without TLS. Details and limits: `PROTOCOL.md` section 20.
 
+### Stock git and git-lfs, no helper
+
+A hub with a published or hosted repo also speaks read-only smart HTTP and the git-lfs download API, so anyone can:
+
+```bash
+git lfs install
+git clone https://hub.example/you/model          # needs only stock git and git-lfs
+torrenthub verify-git --signer <owner key>       # optional, and the only check: stock git believes the hub
+```
+
+Make a repo that stock git-lfs handles with `torrenthub git-init --lfs` (git-lfs does the pointers, and a `pre-push` hook is written that keeps git-lfs from trying to upload to a thub remote; publish with `git push` through `git-remote-thub` or `torrenthub publish --git` as above). `THUB_PUBLIC_URL` must be the address clients reach the hub at, because the LFS download links use it. `THUB_GIT_HTTP_PER_IP_MINUTE` and `THUB_GIT_HTTP_MAX_BODY` limit the git endpoints. Pushing over plain HTTP is refused.
+
 ## Hosting from your own machine
 
 Instead of sending a repo to a hub, serve it yourself from a git repository (same layout as above: big files are LFS pointers in the tree, their bytes in the working tree or git-lfs's cache):
