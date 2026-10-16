@@ -1,11 +1,27 @@
 [project]
 name = "torrenthub"
-version = "0.1.0"
-description = "Hugging Face compatible model mirror that distributes weights over BitTorrent"
+version = "0.2.0"
+description = "A Hugging Face compatible hub that shares model weights over BitTorrent, with signed manifests and git for versioning"
+readme = "README.md"
 requires-python = ">=3.11"
+keywords = ["huggingface", "bittorrent", "models", "mirror", "git", "nostr"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: System :: Distributed Computing",
+]
 dependencies = ["fastapi>=0.143,<1", "uvicorn>=0.54,<1", "httpx>=0.28,<1"]
 
+[project.urls]
+Source = "https://github.com/imattau/torrenthub"
+Documentation = "https://github.com/imattau/torrenthub/blob/main/DEPLOY.md"
+
 [project.optional-dependencies]
+all = ["libtorrent>=2.0,<3", "mcp>=2,<3", "websockets>=15,<18", "coincurve>=21,<22"]
 swarm = ["libtorrent>=2.0,<3"]
 mcp = ["mcp>=2,<3"]
 relay = ["websockets>=15,<18"]

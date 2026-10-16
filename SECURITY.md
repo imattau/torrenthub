@@ -87,6 +87,14 @@ A client now joins a swarm to fetch a file or a history pack, so it announces it
 
 A client or seeder with the DHT on announces which infohashes it holds and asks for others, to every node it reaches, and listens on UDP. With `dhtpublic` on (the default) that includes the public mainline DHT, where anyone can see which infohashes a machine asks for; `thub.dhtpublic=false` (and `THUB_DHT_PUBLIC=0` on the hub) keeps a swarm private. `dht_local` switches off libtorrent's checks that refuse private and loopback nodes and node ids that do not match an address; use it only on a private network. `thub.upnp` asks the home router to open a port. Not reviewed: libtorrent's DHT against hostile nodes; what port mapping exposes.
 
+## Deployment (added with 0.2.0)
+
+`deploy/systemd/torrenthub-hub.service` and `deploy/Containerfile` run the hub as an unprivileged user with a read-only root, no
+capabilities and no new privileges; `DEPLOY.md` says what was tested. The unit's `RestrictAddressFamilies` must include `AF_NETLINK`
+or the hub does not start. The hub holds no signing key; hosts and publishers do, and the tools now warn when a key file is readable by
+other users, and `torrenthub host` refuses to start with git's own environment variables set. Not covered: a container or unit escape,
+the proxy in front, and anything the operator adds.
+
 ## Dependencies
 
 `pip-audit` (2026-10-16) found no known vulnerabilities in `lock/runtime.txt` (36 packages, everything a deployment installs) or `lock/dev.txt`. The earlier run's only findings were against `pip` 24.0 in a development environment, since upgraded.
@@ -95,6 +103,6 @@ Versions are now bounded in `pyproject.toml` (a tested floor and the next major 
 
 ## Not reviewed
 
-TLS and certificate handling (the project relies on httpx and uvicorn defaults; every test and VM run used plain HTTP), the MCP server's tool surface beyond what its tests cover, the libtorrent engine and its DHT against hostile peers, git itself (`index-pack`, `upload-pack`, `pack-objects` and `gc` running on hostile input, as C code we did not read), the container and VM images used for testing, behaviour under real load (every limit was tested for being enforced, none for being the right number), and anything on Windows or macOS.
+TLS and certificate handling (the project relies on httpx and uvicorn defaults; tested once, through Caddy with a private certificate authority, where an untrusted certificate was refused and a trusted one worked; not tested with a public certificate authority or against a hostile server), the MCP server's tool surface beyond what its tests cover, the libtorrent engine and its DHT against hostile peers, git itself (`index-pack`, `upload-pack`, `pack-objects` and `gc` running on hostile input, as C code we did not read), the container and VM images used for testing, behaviour under real load (every limit was tested for being enforced, none for being the right number), and anything on Windows or macOS.
 
 **All three reviews were done by the same author who wrote the code, by reading it and by writing attacks as tests. That finds the mistakes that author can see. It is not an independent audit, and it should not be taken for one.**

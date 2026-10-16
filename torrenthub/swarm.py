@@ -132,6 +132,20 @@ def free_port(host: str = "0.0.0.0") -> int:
     raise OSError("no free port found")
 
 
+def resolve_peer(host: str, port: int) -> tuple[str, int] | None:
+    """An (IP address, port) for a peer given by name or address. libtorrent's connect_peer takes only addresses, so a hub or a peer
+    named in DNS (which is how every real one is named) crashed it. IPv4 is preferred; None if the name does not resolve."""
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        return None
+    v4 = [i for i in infos if i[0] == socket.AF_INET]
+    pick = (v4 or infos)
+    return (pick[0][4][0], port) if pick else None
+
+
 def local_ipv4_addresses() -> list[str]:
     """Every IPv4 address this machine has (Linux). Empty if they cannot be listed."""
     import fcntl
@@ -212,7 +226,8 @@ class LibtorrentSwarm(Swarm):
 
     def _hint_peers(self, handle) -> None:
         for host, port in self.extra_peers:
-            handle.connect_peer((host, port))
+            if (ep := resolve_peer(host, port)) is not None:
+                handle.connect_peer(ep)
 
     def _params(self, torrent_path: Path, save_dir: Path):
         atp = self.lt.add_torrent_params()
@@ -239,7 +254,10 @@ class LibtorrentSwarm(Swarm):
         h = self.ses.find_torrent(self.lt.torrent_info(str(torrent_path)).info_hashes().v1)
         if not h.is_valid():
             return False
-        h.connect_peer((host, port))
+        ep = resolve_peer(host, port)
+        if ep is None:
+            return False
+        h.connect_peer(ep)
         return True
 
     async def forget(self, torrent_path: Path) -> None:

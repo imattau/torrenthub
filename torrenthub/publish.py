@@ -202,7 +202,7 @@ class Ingest:
         self._check_rows(m)
         self._check_kind(m)
         if self._check_seq(m):
-            return {"state": "done", "already": True, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.listen_port}}
+            return {"state": "done", "already": True, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.advertised_swarm_port}}
         self._check_jobs(m)
         work = await self._check_git(m, body) if m.git is not None else None
         try:
@@ -360,7 +360,7 @@ class Ingest:
 
     async def _start(self, m: Manifest, table: bytes | None, body: dict, now: float, work: GitWork | None = None) -> dict:
         if self._check_seq(m):
-            return {"state": "done", "already": True, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.listen_port}}
+            return {"state": "done", "already": True, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.advertised_swarm_port}}
         if sum(1 for j in self.jobs.values() if j.signer == m.pubkey and j.state == "pulling") >= self.s.publish_max_jobs_per_key:
             raise PublishError(429, "TooManyPublications", "this key already has publications in progress")
         inline_raw = body.get("inline") or {}
@@ -457,7 +457,7 @@ class Ingest:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         self.metrics.inc("thub_publish_total", result="started")
-        return {"job": job.id, "state": job.state, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.listen_port},
+        return {"job": job.id, "state": job.state, "repo": m.repo, "commit": m.commit, "swarm": {"port": self.s.advertised_swarm_port},
                 "pulling": sorted(need_swarm)}
 
     # ------------------------------------------------------------------ work

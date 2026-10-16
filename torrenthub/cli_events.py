@@ -226,6 +226,10 @@ def add_event_commands(sub) -> None:
 def _secret(args, p) -> bytes:
     from .signing import parse_secret
 
+    from .signing import key_file_warning
+
+    if args.key_file and (w := key_file_warning(args.key_file)):
+        print(f"warning: {w}", file=sys.stderr)
     raw = Path(args.key_file).read_text() if args.key_file else os.environ.get("THUB_SIGNING_KEY", "")
     if not raw.strip():
         p.error("give --key-file or set THUB_SIGNING_KEY")
@@ -413,6 +417,9 @@ def run_event_command(args, settings, p) -> None:
             from .signing import public_key
 
             logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+            leaked = sorted(k for k in os.environ if k in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"))
+            if leaked:  # these redirect every git command the host runs to somewhere else
+                raise SystemExit(f"error: {', '.join(leaked)} is set in the environment; git would read it for every command torrenthub runs. Unset it (a service file's EnvironmentFile is a common source)")
             secret = _secret(args, p)
             pk = public_key(secret).hex()
             s = dataclasses.replace(settings, public_url=args.public_url.rstrip("/"), roots=[pk], swarm="libtorrent",

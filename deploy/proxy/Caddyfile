@@ -1,0 +1,12 @@
+# TLS for a hub, with certificates from Let's Encrypt. Only HTTP goes through the proxy: the swarm port (TCP and UDP 6881) is not proxied.
+hub.example.org {
+	request_body {
+		max_size 80MB
+	}
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 10m
+		}
+	}
+}

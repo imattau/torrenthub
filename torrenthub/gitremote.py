@@ -262,6 +262,11 @@ class Helper:
         from .signing import parse_secret
 
         path = _git(["config", "--get", f"remote.{self.remote}.thubkeyfile"]) or _git(["config", "--get", "thub.keyfile"]) or os.environ.get("THUB_KEY_FILE", "")
+        if path:
+            from .signing import key_file_warning
+
+            if w := key_file_warning(Path(path).expanduser()):
+                self.log(f"warning: {w}")
         raw = Path(path).expanduser().read_text() if path else os.environ.get("THUB_SIGNING_KEY", "")
         if not raw.strip():
             raise RemoteError("no signing key: set `git config thub.keyfile <path>` (or remote.<name>.thubkeyfile), THUB_KEY_FILE or THUB_SIGNING_KEY")

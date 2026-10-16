@@ -43,11 +43,11 @@ def write_tree(root, files):
 
 
 class Hub:
-    def __init__(self, tmp_path, name="hub", roots=(PK,), quota=100 * 1024 * 1024, swarm_kw=None, **kw):
+    def __init__(self, tmp_path, name="hub", roots=(PK,), quota=100 * 1024 * 1024, swarm_kw=None, public_url_host="127.0.0.1", **kw):
         sp = free_port()
         self.swarm = LibtorrentSwarm(listen_port=sp, listen_host="127.0.0.1", **{"dht": False, **(swarm_kw or {})})
         port = free_port()
-        self.settings = Settings(data_dir=tmp_path / name, upstream="http://127.0.0.1:9", public_url=f"http://127.0.0.1:{port}",
+        self.settings = Settings(data_dir=tmp_path / name, upstream="http://127.0.0.1:9", public_url=f"http://{public_url_host}:{port}",
                                  roots=list(roots), anchor="", listen_port=sp, publish_quota=quota, **kw)
         self.app = create_app(self.settings, swarm=self.swarm)
         self.srv = Server(self.app, port).start()

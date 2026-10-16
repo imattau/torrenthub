@@ -122,6 +122,9 @@ class Settings:
     webseed_upstream: bool = True
     swarm: str = "none"  # "none" or "libtorrent"
     listen_port: int = 6881
+    # The port other machines reach the swarm on, when it is not the one this process listens on (a container with a mapped port,
+    # a router forwarding 51413 to 6881). 0 means the same as listen_port.
+    swarm_public_port: int = 0
     # Static peer hints, "host:port" each. For a known sibling gateway, or to tell "the transfer
     # works" apart from "peer discovery works" when testing. Normal discovery is still on.
     peers: list[str] = field(default_factory=list)
@@ -200,6 +203,11 @@ class Settings:
     prefetch: bool = False
     prefetch_concurrency: int = 2
 
+    @property
+    def advertised_swarm_port(self) -> int:
+        """The swarm port to tell clients about."""
+        return self.swarm_public_port or self.listen_port
+
     @classmethod
     def from_env(cls) -> "Settings":
         e = os.environ.get
@@ -222,6 +230,7 @@ class Settings:
             webseed_upstream=_bool(e("THUB_WEBSEED_UPSTREAM"), True),
             swarm=e("THUB_SWARM", "none"),
             listen_port=int(e("THUB_LISTEN_PORT", "6881")),
+            swarm_public_port=int(e("THUB_SWARM_PUBLIC_PORT", "0")),
             peers=_list(e("THUB_PEERS"), []),
             outgoing_utp=_bool(e("THUB_OUTGOING_UTP"), False),
             manifest_max_age=float(e("THUB_MANIFEST_MAX_AGE")) if e("THUB_MANIFEST_MAX_AGE") else None,

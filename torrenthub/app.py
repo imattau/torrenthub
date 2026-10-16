@@ -382,7 +382,7 @@ def create_app(
         upstream.manifest_max_age = policy_rules.freshness.manifest_max_age  # the environment setting wins if both are given
     tracker = Tracker(settings.tracker_interval, max_peers=settings.tracker_max_peers, per_ip=settings.tracker_per_ip, max_total=settings.tracker_max_total)
     if swarm.enabled:
-        tracker.self_peer = own_endpoint(settings.public_url, settings.listen_port)
+        tracker.self_peer = own_endpoint(settings.public_url, settings.advertised_swarm_port)
     mirror = Mirror(settings, store, upstream, swarm, metrics)
     ingest = Ingest(settings, store, swarm, pinned, lambda: admission.graph(), metrics)
 
@@ -590,10 +590,10 @@ def create_app(
     @app.get("/api/thub/info")
     async def hub_info():
         """What a client needs to join this hub's swarm directly, besides trackers and DHT."""
-        return {"swarm": {"enabled": bool(swarm.enabled), "port": settings.listen_port if swarm.enabled else None},
+        return {"swarm": {"enabled": bool(swarm.enabled), "port": settings.advertised_swarm_port if swarm.enabled else None},
                 "public_url": settings.public_url, "trackers": list(settings.trackers),
                 "tracker": f"{settings.public_url}/announce" if settings.tracker and swarm.enabled else None,
-                "dht": {"host": urlsplit(settings.public_url).hostname, "port": settings.listen_port} if settings.dht and swarm.enabled else None}
+                "dht": {"host": urlsplit(settings.public_url).hostname, "port": settings.advertised_swarm_port} if settings.dht and swarm.enabled else None}
 
     @app.get("/announce")
     async def announce(request: Request):

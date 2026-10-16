@@ -283,3 +283,18 @@ def verify_event(ev: dict) -> bool:
         return verify(bytes.fromhex(ev["id"]), bytes.fromhex(ev["pubkey"]), bytes.fromhex(ev["sig"]))
     except (KeyError, TypeError, ValueError):
         return False
+
+
+def key_file_warning(path) -> str | None:
+    """A sentence about a signing key file that other users of this machine can read, or None. The key is the whole of an
+    identity: whoever can read the file can publish as its owner."""
+    import os
+    import stat
+
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return None
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return f"{path} is readable by other users (mode {stat.S_IMODE(mode):o}); anyone who can read it can sign as you. Run: chmod 600 {path}"
+    return None

@@ -280,6 +280,20 @@ torrenthub verify-git --signer <owner key>       # optional, and the only check:
 
 Make a repo that stock git-lfs handles with `torrenthub git-init --lfs` (git-lfs does the pointers, and a `pre-push` hook is written that keeps git-lfs from trying to upload to a thub remote; publish with `git push` through `git-remote-thub` or `torrenthub publish --git` as above). `THUB_PUBLIC_URL` must be the address clients reach the hub at, because the LFS download links use it. `THUB_GIT_HTTP_PER_IP_MINUTE` and `THUB_GIT_HTTP_MAX_BODY` limit the git endpoints. Pushing over plain HTTP is refused.
 
+## Running it
+
+`DEPLOY.md` is the operator's guide: install (pip at the locked versions, or a container), `torrenthub doctor` to check a machine and a
+running hub, systemd units, a TLS proxy, backups and upgrades, a hardening checklist, and a table of symptoms and causes.
+
+```bash
+pip install -c lock/runtime.txt 'torrenthub[swarm,fast,relay]'
+torrenthub --version && torrenthub doctor
+podman build --format docker -f deploy/Containerfile -t torrenthub .
+```
+
+Two settings matter for any real deployment: `THUB_PUBLIC_URL` (the address clients reach the hub at; web seeds, LFS links and the tracker
+address are built from it) and `THUB_SWARM_PUBLIC_PORT` (the swarm port as seen from outside, if it is not the one the hub listens on).
+
 ## Hosting from your own machine
 
 Instead of sending a repo to a hub, serve it yourself from a git repository (same layout as above: big files are LFS pointers in the tree, their bytes in the working tree or git-lfs's cache):

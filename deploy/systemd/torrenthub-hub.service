@@ -1,0 +1,52 @@
+# A hub as a system service, behind a reverse proxy on the same machine (deploy/proxy). See DEPLOY.md.
+#   useradd --system --home /var/lib/torrenthub --shell /usr/sbin/nologin torrenthub     (or: systemd-sysusers deploy/systemd/sysusers.conf)
+#   python3 -m venv /opt/torrenthub && /opt/torrenthub/bin/pip install -c lock/runtime.txt 'torrenthub[swarm,fast,relay]'
+#   install -d -m 750 /etc/torrenthub && cp deploy/systemd/hub.env.example /etc/torrenthub/hub.env   (then edit it)
+#   cp deploy/systemd/torrenthub-hub.service /etc/systemd/system/ && systemctl enable --now torrenthub-hub
+[Unit]
+Description=torrenthub hub: a Hugging Face compatible hub that shares model weights over BitTorrent
+Documentation=https://github.com/imattau/torrenthub/blob/main/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=torrenthub
+Group=torrenthub
+EnvironmentFile=/etc/torrenthub/hub.env
+Environment=THUB_DATA=/var/lib/torrenthub
+StateDirectory=torrenthub
+StateDirectoryMode=0750
+# Refuse to start a hub that is set up wrongly (the doctor exits 1 only for a failed check, not for a warning).
+ExecStartPre=/opt/torrenthub/bin/torrenthub doctor
+ExecStart=/opt/torrenthub/bin/torrenthub serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# Sandbox. The hub writes only under /var/lib/torrenthub, runs git on strangers' data, and talks over IP.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+# AF_NETLINK is needed: libtorrent lists the network interfaces over netlink, and without it the hub exits at start (tested).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+ReadWritePaths=/var/lib/torrenthub
+
+[Install]
+WantedBy=multi-user.target

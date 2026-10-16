@@ -356,7 +356,8 @@ def make_pack(repo: Path, head: str, have: list[str], *, fsize: int = 1 << 31, t
 def pack_object_count(repo: Path, pack_sha: str) -> int:
     """How many objects an indexed pack holds."""
     idx = Path(repo) / "objects" / "pack" / f"pack-{pack_sha}.idx"
-    _, out, _ = run_git(["show-index"], stdin=idx.read_bytes(), sandbox=True, fsize=1 << 30)
+    # Inside the repository: `git show-index` run outside any repository crashes (segmentation fault) on git 2.47.3.
+    _, out, _ = run_git(["show-index"], cwd=repo, stdin=idx.read_bytes(), sandbox=True, fsize=1 << 30)
     return out.count(b"\n")
 
 

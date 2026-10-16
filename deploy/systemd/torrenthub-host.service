@@ -1,0 +1,26 @@
+# Your own machine hosting your own git repo (torrenthub host), as a service of YOUR user, so it can read your repo and key:
+#   mkdir -p ~/.config/systemd/user ~/.config/torrenthub && cp deploy/systemd/torrenthub-host.service ~/.config/systemd/user/
+#   cp deploy/systemd/host.env.example ~/.config/torrenthub/host.env   (then edit it; chmod 600 your key file)
+#   systemctl --user enable --now torrenthub-host && loginctl enable-linger $USER      (linger keeps it running when you log out)
+[Unit]
+Description=torrenthub host: serve %h's model repository over BitTorrent
+Documentation=https://github.com/imattau/torrenthub/blob/main/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/torrenthub/host.env
+ExecStart=%h/.local/share/torrenthub/venv/bin/torrenthub host --git ${REPO_DIR} --repo ${REPO} --key-file ${KEY_FILE} --public-url ${PUBLIC_URL} --port ${HTTP_PORT} --listen-port ${SWARM_PORT} --poll 10
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=default.target

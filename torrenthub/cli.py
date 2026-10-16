@@ -23,13 +23,27 @@ def _mirror(settings: Settings) -> Mirror:
     )
 
 
+def _version() -> str:
+    from importlib import metadata
+
+    try:
+        return metadata.version("torrenthub")
+    except metadata.PackageNotFoundError:
+        return "unknown (not installed)"
+
+
 def main(argv: list[str] | None = None) -> None:
     p = argparse.ArgumentParser(prog="torrenthub")
+    p.add_argument("--version", action="version", version=f"torrenthub {_version()}")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("serve", help="run the HF-compatible gateway")
     s.add_argument("--host", default="0.0.0.0")
     s.add_argument("--port", type=int, default=8080)
+    s.add_argument("--log-level", default="info", choices=["debug", "info", "warning", "error"])
+
+    dr = sub.add_parser("doctor", help="check this machine and the settings (THUB_*) for running a hub; exit 1 if something is wrong")
+    dr.add_argument("--probe", action="store_true", help="also ask the running hub at THUB_PUBLIC_URL what it believes, and try its swarm port")
 
     m = sub.add_parser("mirror", help="mirror a repo (all files) and build torrents")
     m.add_argument("repo_id")
@@ -77,10 +91,28 @@ def main(argv: list[str] | None = None) -> None:
     args = p.parse_args(argv)
     settings = Settings.from_env()
 
+    if args.cmd == "doctor":
+        from .doctor import run as run_doctor
+
+        checks = run_doctor(settings, probe=args.probe)
+        for c in checks:
+            print(c.line())
+        bad = sum(c.level == "fail" for c in checks)
+        warn = sum(c.level == "warn" for c in checks)
+        print(f"{len(checks)} checks: {bad} failed, {warn} warnings")
+        raise SystemExit(1 if bad else 0)
     if args.cmd == "serve":
+        import logging
+
         import uvicorn
 
-        uvicorn.run(create_app(settings), host=args.host, port=args.port)
+        from .doctor import run as run_doctor
+
+        logging.basicConfig(level=getattr(logging, args.log_level.upper()), format="%(asctime)s %(levelname)s %(name)s %(message)s")
+        for c in run_doctor(settings):
+            if c.level != "ok":
+                logging.getLogger("torrenthub.doctor").warning("%s", c.line())
+        uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level=args.log_level)
     elif args.cmd == "mirror":
         mirror = _mirror(settings)
 
