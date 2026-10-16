@@ -1,0 +1,276 @@
+# Builds everything that is shipped, tests each artifact by installing and running it, and (on a version tag only)
+# publishes a GitHub release. Nothing is published by a branch push or a manual run: those only build and test.
+#
+#   artifacts:  wheel + sdist | standalone builds for Linux x86-64/arm64, Windows x86-64, macOS arm64/x86-64 |
+#               .deb and .rpm for x86-64 and arm64 | a container image (pushed to ghcr.io on a tag)
+#   publishing: a tag v<version> (which must match pyproject.toml) creates the release. PyPI is published only if the
+#               repository variable PUBLISH_PYPI is "true" and PyPI trusted publishing has been set up for this repo.
+#
+# Actions are pinned by tag, not by commit; pin them by commit before relying on this for anything that matters.
+name: release
+on:
+  push:
+    tags: ["v*"]
+    branches: [platforms]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          v=$(python3 -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = tag ] && [ "${GITHUB_REF_NAME}" != "v$v" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match pyproject.toml version $v"; exit 1
+          fi
+
+  dist:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install build twine && python -m build && python -m twine check dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  binary:
+    needs: version
+    name: binary ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is built inside a manylinux image (glibc 2.28), so it runs on Debian 10+, Ubuntu 20.04+, RHEL 8+ and newer.
+          - {name: linux-x86_64,   os: ubuntu-24.04,     container: "quay.io/pypa/manylinux_2_28_x86_64",  vpy: "venv/bin/python",         archive: tar.gz}
+          - {name: linux-arm64,    os: ubuntu-24.04-arm, container: "quay.io/pypa/manylinux_2_28_aarch64", vpy: "venv/bin/python",         archive: tar.gz}
+          - {name: windows-x86_64, os: windows-2022,     container: "",                                   vpy: "venv/Scripts/python.exe", archive: zip}
+          - {name: macos-arm64,    os: macos-14,         container: "",                                   vpy: "venv/bin/python",         archive: tar.gz}
+          - {name: macos-x86_64,   os: macos-15-intel,   container: "",                                   vpy: "venv/bin/python",         archive: tar.gz}
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        if: matrix.container == ''
+        with:
+          python-version: "3.12"
+      - name: Python (manylinux image)
+        if: matrix.container != ''
+        run: echo "/opt/python/cp312-cp312/bin" >> "$GITHUB_PATH"
+      - name: Install into a clean virtualenv
+        shell: bash
+        run: |
+          python -m venv venv
+          ${{ matrix.vpy }} -m pip install --upgrade pip
+          ${{ matrix.vpy }} -m pip install pyinstaller
+          ${{ matrix.vpy }} -m pip install ".[all]"
+          ${{ matrix.vpy }} -m pip freeze > frozen.txt
+      - name: Build
+        shell: bash
+        run: ${{ matrix.vpy }} -m PyInstaller --noconfirm --distpath dist-bin --workpath build-bin packaging/torrenthub.spec
+      - name: Smoke test the build
+        shell: bash
+        run: |
+          ext=""; [ "${{ matrix.archive }}" = zip ] && ext=".exe"
+          ${{ matrix.vpy }} packaging/smoke_binary.py "dist-bin/torrenthub/torrenthub$ext" "dist-bin/torrenthub/git-remote-thub$ext"
+      - name: Archive
+        shell: bash
+        run: |
+          cp LICENSE README.md DEPLOY.md dist-bin/torrenthub/
+          cp frozen.txt dist-bin/torrenthub/BUILT-WITH.txt
+          name="torrenthub-${{ needs.version.outputs.version }}-${{ matrix.name }}"
+          ${{ matrix.vpy }} - <<EOF
+          import shutil
+          shutil.make_archive("$name", "${{ matrix.archive == 'zip' && 'zip' || 'gztar' }}", "dist-bin", "torrenthub")
+          EOF
+          ls -la "$name".*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.name }}
+          path: torrenthub-*.*
+
+  linux-packages:
+    needs: [version, binary]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.41.1
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-linux-*
+          merge-multiple: true
+          path: bins
+      - name: Build .deb and .rpm for each architecture
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          mkdir -p pkgs
+          for pair in "x86_64:amd64" "arm64:arm64"; do
+            src=${pair%%:*}; arch=${pair##*:}
+            rm -rf dist-bin && mkdir dist-bin && tar -xzf "bins/torrenthub-${VERSION}-linux-${src}.tar.gz" -C dist-bin
+            for fmt in deb rpm; do
+              NFPM_ARCH=$arch "$(go env GOPATH)/bin/nfpm" package -f packaging/linux/nfpm.yaml -p $fmt -t pkgs/
+            done
+          done
+          ls -la pkgs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: pkgs/*
+
+  test-packages:
+    # Install each package the way a user would, in the distributions it claims to support, and run the smoke test.
+    needs: linux-packages
+    name: install ${{ matrix.image }} (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {image: "debian:12",        fmt: deb, arch: amd64, os: ubuntu-24.04}
+          - {image: "debian:13",        fmt: deb, arch: amd64, os: ubuntu-24.04}
+          - {image: "ubuntu:22.04",     fmt: deb, arch: amd64, os: ubuntu-24.04}
+          - {image: "ubuntu:24.04",     fmt: deb, arch: amd64, os: ubuntu-24.04}
+          - {image: "ubuntu:24.04",     fmt: deb, arch: arm64, os: ubuntu-24.04-arm}
+          - {image: "fedora:latest",    fmt: rpm, arch: amd64, os: ubuntu-24.04}
+          - {image: "rockylinux:9",     fmt: rpm, arch: amd64, os: ubuntu-24.04}
+          - {image: "fedora:latest",    fmt: rpm, arch: arm64, os: ubuntu-24.04-arm}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: pkgs
+      - name: Install and smoke test inside ${{ matrix.image }}
+        run: |
+          case "${{ matrix.fmt }}" in
+            deb) install='apt-get update -qq && apt-get install -y -qq python3 /pkgs/torrenthub_*_${{ matrix.arch }}.deb' ;;
+            rpm) arch=${{ matrix.arch }}; [ $arch = amd64 ] && arch=x86_64 || arch=aarch64
+                 install="dnf install -y -q python3 /pkgs/torrenthub-*.${arch}.rpm" ;;
+          esac
+          docker run --rm -v "$PWD/pkgs:/pkgs:ro" -v "$PWD/packaging:/packaging:ro" "${{ matrix.image }}" sh -ec "
+            $install
+            command -v torrenthub git-remote-thub git
+            getent passwd torrenthub
+            ls -l /etc/torrenthub /usr/lib/systemd/system/torrenthub.service /usr/lib/sysusers.d/torrenthub.conf
+            torrenthub --version
+            python3 /packaging/smoke_binary.py /usr/bin/torrenthub /usr/bin/git-remote-thub
+          "
+
+  test-service:
+    # The runner is a real Ubuntu machine with systemd: install the .deb on it and start the hardened service for real.
+    needs: linux-packages
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-packages
+          path: pkgs
+      - name: Install, configure and start the service
+        run: |
+          arch=$(dpkg --print-architecture)
+          sudo apt-get update -qq && sudo apt-get install -y -qq ./pkgs/torrenthub_*_${arch}.deb
+          systemctl is-active torrenthub && { echo "::error::the package started the service by itself"; exit 1; } || true
+          key=$(python3 -c "print('02'*32)")
+          sudo tee /etc/torrenthub/hub.env >/dev/null <<EOF
+          THUB_PUBLIC_URL=http://127.0.0.1:8080
+          THUB_SWARM=libtorrent
+          THUB_LISTEN_PORT=6881
+          THUB_ROOTS=$(/usr/bin/torrenthub keygen | python3 -c "import json,sys;print(json.load(sys.stdin)['pubkey_hex'])")
+          THUB_PUBLISH_QUOTA=1G
+          THUB_UPSTREAM=http://127.0.0.1:9
+          EOF
+          sudo systemctl start torrenthub || { sudo journalctl -u torrenthub --no-pager | tail -40; exit 1; }
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8080/healthz && break; sleep 1; done
+          curl -sf http://127.0.0.1:8080/api/thub/info
+          echo; ps -o user= -p "$(systemctl show -p MainPID --value torrenthub)" | grep -qx torrenthub
+          systemctl show torrenthub -p NoNewPrivileges -p ProtectSystem -p User
+          sudo systemctl stop torrenthub
+          sudo apt-get remove -y -qq torrenthub
+          test -d /var/lib/torrenthub && echo "data kept on removal: ok"
+          getent passwd torrenthub >/dev/null && echo "user kept on removal: ok"
+
+  container:
+    needs: version
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to ghcr.io (a tag only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Containerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.version.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+
+  release:
+    # Only for a version tag, and only after everything above passed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [version, dist, binary, linux-packages, test-packages, test-service, container]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        run: cd artifacts && sha256sum * > SHA256SUMS && cat SHA256SUMS
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" artifacts/* --repo "${GITHUB_REPOSITORY}" --title "torrenthub ${GITHUB_REF_NAME#v}" \
+            --notes "Standalone builds (Linux, Windows, macOS), .deb and .rpm packages, a wheel and an sdist. Builds are not code-signed: see DEPLOY.md. Verify downloads against SHA256SUMS."
+
+  pypi:
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_PYPI == 'true'
+    needs: [dist, release]
+    runs-on: ubuntu-24.04
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

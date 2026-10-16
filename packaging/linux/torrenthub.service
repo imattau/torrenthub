@@ -1,0 +1,49 @@
+# Installed by the torrenthub package. Set up /etc/torrenthub/hub.env, then:  systemctl enable --now torrenthub
+# Put a TLS reverse proxy in front of 127.0.0.1:8080 (DEPLOY.md). The package starts nothing by itself.
+[Unit]
+Description=torrenthub hub: a Hugging Face compatible hub that shares model weights over BitTorrent
+Documentation=https://github.com/imattau/torrenthub/blob/main/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=torrenthub
+Group=torrenthub
+EnvironmentFile=/etc/torrenthub/hub.env
+Environment=THUB_DATA=/var/lib/torrenthub
+StateDirectory=torrenthub
+StateDirectoryMode=0750
+# Refuse to start a hub that is set up wrongly (the doctor exits 1 only for a failed check, not for a warning).
+ExecStartPre=/usr/bin/torrenthub doctor
+ExecStart=/usr/bin/torrenthub serve --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+
+# Sandbox. The hub writes only under /var/lib/torrenthub, runs git on strangers' data, and talks over IP.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+# AF_NETLINK is needed: libtorrent lists the network interfaces over netlink, and without it the hub exits at start (tested).
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+ReadWritePaths=/var/lib/torrenthub
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,53 @@
+# Build:  VERSION=0.2.0 NFPM_ARCH=amd64 nfpm package -f packaging/linux/nfpm.yaml -p deb   (or -p rpm)
+# Expects the PyInstaller output in dist-bin/torrenthub/ (see packaging/torrenthub.spec).
+name: torrenthub
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: "torrenthub <imattau@users.noreply.github.com>"
+description: |
+  A Hugging Face compatible model hub that shares weights over BitTorrent.
+  Signed manifests say who published what, git versions a repository, and an
+  MCP server lets agents use it. This package holds a self-contained build
+  (its own Python and libtorrent) under /opt/torrenthub.
+vendor: torrenthub
+homepage: https://github.com/imattau/torrenthub
+license: MIT
+contents:
+  - src: dist-bin/torrenthub/
+    dst: /opt/torrenthub/
+    type: tree
+  - src: /opt/torrenthub/torrenthub
+    dst: /usr/bin/torrenthub
+    type: symlink
+  - src: /opt/torrenthub/git-remote-thub
+    dst: /usr/bin/git-remote-thub
+    type: symlink
+  - src: packaging/linux/torrenthub.service
+    dst: /usr/lib/systemd/system/torrenthub.service
+  - src: packaging/linux/sysusers.conf
+    dst: /usr/lib/sysusers.d/torrenthub.conf
+  - src: packaging/linux/hub.env
+    dst: /etc/torrenthub/hub.env
+    type: config|noreplace
+    file_info:
+      mode: 0640
+  - src: LICENSE
+    dst: /usr/share/doc/torrenthub/LICENSE
+  - src: README.md
+    dst: /usr/share/doc/torrenthub/README.md
+  - src: DEPLOY.md
+    dst: /usr/share/doc/torrenthub/DEPLOY.md
+overrides:
+  deb:
+    depends:
+      - git
+  rpm:
+    depends:
+      - git-core
+scripts:
+  postinstall: packaging/linux/postinstall.sh
+  preremove: packaging/linux/preremove.sh
+  postremove: packaging/linux/postremove.sh
