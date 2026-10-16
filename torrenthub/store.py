@@ -349,6 +349,15 @@ class Store:
             rows = self._db.execute("SELECT DISTINCT path FROM files WHERE blob_key=? ORDER BY path", (key,)).fetchall()
         return [r[0] for r in rows]
 
+    def locate_blob(self, key: str, limit: int = 50) -> list[dict]:
+        """Where a blob is found in the current branch heads of the repos held here."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT f.repo_id AS repo, f.commit_sha AS commit_sha, f.path AS path, f.size AS size, r.ref AS ref "
+                "FROM files f JOIN refs r ON r.repo_id = f.repo_id AND r.commit_sha = f.commit_sha "
+                "WHERE f.blob_key = ? ORDER BY f.repo_id, r.ref, f.path LIMIT ?", (key, max(1, min(int(limit), 200)))).fetchall()
+        return [{"repo": r["repo"], "ref": r["ref"], "commit": r["commit_sha"], "path": r["path"], "size": r["size"]} for r in rows]
+
     def complete_lfs_blobs(self) -> list[str]:
         with self._lock:
             rows = self._db.execute("SELECT key FROM blobs WHERE state='complete' AND key NOT LIKE 'git-%' ORDER BY key").fetchall()

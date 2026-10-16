@@ -209,16 +209,16 @@ torrenthub mcp --gateway https://hub.example --download-root ./dl --work-root ./
 
 | Tool | Needs a key | What it does |
 |---|---|---|
-| `find_repos`, `repo_history`, `compare_revisions`, `download_repo`, `lineage`, `trust_of`, `list_events`, `list_requests`, `hash_local_file`, `whoami` | no | Find a repo, read its signed history (each signature checked here), see what changed between two revisions, download a whole snapshot with every hash checked, see what a file was made from, ask how far the gateway trusts a key |
+| `find_repos`, `find_by_hash`, `repo_history`, `compare_revisions`, `download_repo`, `lineage`, `trust_of`, `list_events`, `list_requests`, `hash_local_file`, `whoami` | no | Find a repo, read its signed history (each signature checked here), see what changed between two revisions, download a whole snapshot with every hash checked, see what a file was made from, ask how far the gateway trusts a key |
 | `publish_repo` | yes | Publish a folder under `--work-root` as a signed repo. A folder with `.git` goes with its history |
-| `declare_derivation` | yes | Sign how a model was made: inputs, outputs, tool, data origin, licences |
-| `report_eval` | yes | Sign a benchmark result for a file (class R: a reported result, with the dataset hash and settings so others can redo it) |
+| `declare_derivation` | yes | Sign how a model was made: inputs, outputs, tool, data origin, licences. `tool_file` makes the server hash the training script into the claim |
+| `report_eval` | yes | Sign a benchmark result for a file (class R: a reported result, with the dataset hash and settings so others can redo it). `harness_file` makes the server hash the evaluation script into the claim |
 | `post_request`, `claim_request`, `submit_result` | yes | Ask for work, say you are on it, answer |
 | `retract_event` | yes | Withdraw one of the agent's own earlier events |
 
 The tools that sign or publish are not offered at all without `--agent-key-file`. What stops an agent doing harm with them: its key is a delegation that expires and can be revoked; it publishes only to `--allow-repo` globs and only from under `--work-root` (links that lead outside are refused); the operator's per hour and per day limits, size cap and expiry are checked in this process and counted again from the audit log after a restart; every action, signed or refused, is in the audit log. Delegating authority (`delegate`, `endorse`, `revoke` of keys) is deliberately **not** a tool: an agent cannot widen its own trust. A key the gateway does not know can still post events, but they are held in quarantine and the tool says so. Text from other participants (request arguments, notes, repo names) is labelled untrusted data in every result.
 
-Tested with 18 tests that drive the tools over a real MCP session against a real hub (publish, a second version, history, compare, download, derivation read back through lineage, an eval, two agents on one request, retraction, every limit, links, a git repo with history, and the command line flags). Not tested: a real LLM client making these choices, a long autonomous run, or any hub other than this code.
+Tested with 25 tests that drive the tools over a real MCP session against a real hub (publish, a second version, history, compare, download, derivation read back through lineage, an eval, two agents on one request, retraction, every limit, links, a git repo with history, and the command line flags). Then run for real: three subagents used the tools through a thin MCP client (a fine-tune-and-publish agent, an independent verifier answering its request, and a second agent that declined to publish a gain within noise), and a fourth tried to break the limits. What that found, and what is still open, is in `PROTOCOL.md` section 25. Not tested: a long autonomous run, other models, or any hub other than this code.
 
 ## Validating it for real
 

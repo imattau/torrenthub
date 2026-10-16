@@ -106,3 +106,14 @@ Versions are now bounded in `pyproject.toml` (a tested floor and the next major 
 TLS and certificate handling (the project relies on httpx and uvicorn defaults; tested once, through Caddy with a private certificate authority, where an untrusted certificate was refused and a trusted one worked; not tested with a public certificate authority or against a hostile server), the MCP server's tool surface beyond what its tests cover (including the agent key tools: prompt injection through a request's text is handled by labelling and by the operator's limits, which no review has tried to defeat), the libtorrent engine and its DHT against hostile peers, git itself (`index-pack`, `upload-pack`, `pack-objects` and `gc` running on hostile input, as C code we did not read), the container and VM images used for testing, behaviour under real load (every limit was tested for being enforced, none for being the right number), and anything on Windows or macOS.
 
 **All three reviews were done by the same author who wrote the code, by reading it and by writing attacks as tests. That finds the mistakes that author can see. It is not an independent audit, and it should not be taken for one.**
+
+## Agent tools (MCP with an agent key)
+
+Reviewed by running them: a hostile subagent made about 110 calls trying to cross the repo allow-list, the work-folder boundary, the size cap and the rate limit, and failed; nothing crashed or leaked. That is one tester with the tools only, not a review of the code by someone else.
+
+Known and left open:
+
+- **A compromised or injected agent can sign false claims** about any hash within its event limit; nothing checks they refer to anything real. Bound the damage with a short delegation, a small `--max-events-per-day`, and `--valid-hours`.
+- **`publish_repo` runs git using the folder's own repository config.** Keys that name a program were tried and none ran; that is not a proof. Keep repositories you did not make out of the work folder, or run the MCP server where that does not matter.
+- **Anything the agent can read it can publish if it copies it into the work folder.** The boundary is about the paths the tools take, not about what the agent can do with a shell.
+- **Text from other participants is labelled, not filtered.** Three agents ignored a planted instruction in a README; one model family, a handful of tries.

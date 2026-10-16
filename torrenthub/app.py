@@ -519,6 +519,15 @@ def create_app(
     async def model_info(repo_id: str):
         return await _model_info(repo_id, "main")
 
+    @app.get("/api/thub/blobs/{sha256}")
+    async def locate_blob(sha256: str, limit: int = 50):
+        """Which repos held here have this file (by sha256) at a branch head. Requests and derivations name files
+        by hash only, so this is how a reader finds bytes. The paths are the publishers' words, so data."""
+        if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+            return JSONResponse({"error": "sha256 must be 64 lowercase hex characters"}, status_code=400)
+        return JSONResponse({"sha256": sha256, "found": store.locate_blob(sha256, limit), "blocked": store.is_blocked(sha256)},
+                            headers={"X-Mirror": "torrenthub"})
+
     @app.get("/api/thub/repos")
     async def list_repos(q: str = "", limit: int = 50):
         """Repos this hub holds a branch of. `published_by` is the key that published it here, or null
@@ -795,6 +804,13 @@ def create_app(
         anchor = getattr(getattr(up, "anchor", None), "base_url", None) or (
             up.base_url if getattr(up, "is_anchor", False) else None
         )
+        published_here = store.is_published(repo_id)
+        if published_here and not mode.startswith(("signed:", "anchor")):
+            # a repo published to this hub gets its hashes from manifests signed by its publishers (and checked
+            # against this hub's roots on the way in), whatever the upstream setting says about mirrored repos
+            keys = sorted({ev["pubkey"] for ev in store.list_manifests(repo_id) if isinstance(ev, dict) and "pubkey" in ev})
+            if keys:
+                mode = "signed:" + "+".join(keys)
         try:
             mirror.check_repo(repo_id)
             allowed = True
@@ -804,6 +820,7 @@ def create_app(
             {
                 "repo": repo_id,
                 "allowed": allowed,
+                "published_here": published_here,
                 "hash_source": mode.split(":")[0],
                 "signers": mode[len("signed:"):].split("+") if mode.startswith("signed:") else [],
                 "anchor": anchor,

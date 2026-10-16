@@ -162,6 +162,9 @@ def build_server(gateway: str, download_root: Path, max_bytes: int = 20 * 1024**
             "upstream": "Hashes come from the configured upstream, trusted by setting. No independent check.",
         }
         doc["meaning"] = meaning.get(doc["hash_source"], "")
+        if doc.get("published_here"):
+            doc["meaning"] += (" This repo was published to this gateway: the manifests are signed by the listed keys, and the gateway checked "
+                               "each signer against its roots before accepting it. repo_history shows them with their signatures checked here.")
         return doc
 
     async def _download(repo_id: str, path: str, revision: str) -> dict:
@@ -223,7 +226,8 @@ def build_server(gateway: str, download_root: Path, max_bytes: int = 20 * 1024**
     async def get_verdict(repo_id: str, path: str, claim: str = "format_scan", independent: int = 1, min_trust: float = 0.0,
                           revision: str = "main") -> dict:
         """What the signed attestations held by the gateway say about one file (for example a format_scan), judged from the
-        gateway's own trusted keys. status is satisfied, negative (a trusted attestor reports a problem) or unsatisfied."""
+        gateway's own trusted keys. status is satisfied, negative (a trusted attestor reports a problem) or unsatisfied. keys are the attestors that COUNT toward the verdict (trusted ones); ok_attestors and
+        failed_attestors list every key that said ok or failed, trusted or not, so a key listed there but absent from keys was not counted."""
         _check_repo(repo_id)
         _check_rev(revision)
         info, _ = await _info(repo_id, revision)
