@@ -228,4 +228,4 @@ written refused the network-interface lookup libtorrent needs, so the service wo
 - All the validation was done on one machine and a virtual network (`validation/README.md`). Discovery and transfer across the real
   internet, between separate networks and real routers, has not been tried.
 - Nobody but the author has audited this (`SECURITY.md`).
-- No licence has been chosen for the code; until the owner picks one, nobody else may use it.
+- MIT licensed (`LICENSE`), which also means no warranty.

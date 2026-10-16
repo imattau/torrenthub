@@ -333,3 +333,6 @@ torrenthub relay-check ws://127.0.0.1:7777                 # TEST a relay you ru
 
 A pulled event goes through the same checks as one from a hub, so a relay is trusted for nothing. Relays often refuse events over 64 KiB without publishing it; pushes skip those unless you pass `--max-event-bytes 0`. See `PROTOCOL.md` section 17 for what was measured.
 
+## Licence
+
+MIT. See `LICENSE`.

@@ -3,6 +3,8 @@ name = "torrenthub"
 version = "0.2.0"
 description = "A Hugging Face compatible hub that shares model weights over BitTorrent, with signed manifests and git for versioning"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 keywords = ["huggingface", "bittorrent", "models", "mirror", "git", "nostr"]
 classifiers = [
@@ -33,7 +35,7 @@ torrenthub = "torrenthub.cli:main"
 git-remote-thub = "torrenthub.gitremote:main"
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]

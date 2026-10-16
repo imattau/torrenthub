@@ -1,4 +1,4 @@
-include README.md DEPLOY.md HOSTING.md PROTOCOL.md ARCHITECTURE.md SECURITY.md
+include LICENSE README.md DEPLOY.md HOSTING.md PROTOCOL.md ARCHITECTURE.md SECURITY.md
 recursive-include lock *.txt *.md
 recursive-include deploy *
 global-exclude __pycache__ *.pyc
