@@ -192,6 +192,9 @@ class LibtorrentSwarm(Swarm):
             # link that measured about 20 MB/s against 350 MB/s over TCP, so dial TCP. Incoming
             # uTP stays on, so peers that prefer it can still reach us.
             "enable_outgoing_utp": outgoing_utp,
+            # A peer that could not be reached is tried again after this many seconds; the default is 60. With only a few
+            # peers, most of them hints that may be started a moment after we are, a minute is a long time to wait.
+            "min_reconnect_time": 5,
         }
         if not dht_public:
             settings["dht_bootstrap_nodes"] = ""  # do not contact the public bootstrap routers: a private swarm, or a test

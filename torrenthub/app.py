@@ -380,7 +380,7 @@ def create_app(
     policy_rules = load_policy(settings.policy)
     if isinstance(upstream, UpstreamSet) and upstream.manifest_max_age is None:
         upstream.manifest_max_age = policy_rules.freshness.manifest_max_age  # the environment setting wins if both are given
-    tracker = Tracker(settings.tracker_interval, max_peers=settings.tracker_max_peers)
+    tracker = Tracker(settings.tracker_interval, max_peers=settings.tracker_max_peers, per_ip=settings.tracker_per_ip, max_total=settings.tracker_max_total)
     if swarm.enabled:
         tracker.self_peer = own_endpoint(settings.public_url, settings.listen_port)
     mirror = Mirror(settings, store, upstream, swarm, metrics)
@@ -709,8 +709,10 @@ def create_app(
         out = []
         for o in objs:
             oid, size = (o.get("oid"), o.get("size")) if isinstance(o, dict) else (None, None)
+            size = size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else 0  # what we send back is a number, not what was sent
+            oid = oid if isinstance(oid, str) else ""
             if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{64}", oid):
-                out.append({"oid": str(oid)[:80], "size": size if isinstance(size, int) else 0, "error": {"code": 422, "message": "not a sha256"}})
+                out.append({"oid": oid[:80], "size": size, "error": {"code": 422, "message": "not a sha256"}})
             elif not store.repo_has_blob(repo, oid) or store.is_blocked(oid):
                 out.append({"oid": oid, "size": size, "error": {"code": 404, "message": "this repository has no such object"}})
             elif not store.blob_complete(oid):

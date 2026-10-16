@@ -260,4 +260,8 @@ async def hub_heads(client: httpx.AsyncClient, hub: str, repo: str) -> list[str]
     r = await client.get(f"{hub}/api/thub/git/{quote(repo, safe='/')}/refs")
     if r.status_code != 200:
         return []
-    return sorted(set(r.json().get("refs", {}).values()))
+    try:
+        vals = r.json().get("refs", {}).values()
+    except (ValueError, AttributeError):
+        return []
+    return sorted({v for v in vals if isinstance(v, str) and gitrepo.SHA40.fullmatch(v)})  # whatever else a hub says is not a commit id

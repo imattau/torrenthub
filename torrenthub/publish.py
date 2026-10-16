@@ -26,6 +26,7 @@ or stop a publisher from filling its own quota with junk.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import base64
 import binascii
 import hashlib
@@ -114,6 +115,25 @@ class Ingest:
         self._tasks: set[asyncio.Task] = set()
         self._locks: dict[str, asyncio.Lock] = {}
         self._git_slots = asyncio.Semaphore(2)  # git commands on publishers' objects run two at a time
+        self._read_slots = asyncio.Semaphore(max(1, settings.git_read_slots))  # and anonymous readers have slots of their own, so they cannot starve publishers
+
+    @contextlib.asynccontextmanager
+    async def _slot(self, sem: asyncio.Semaphore):
+        """A place to run git, or a 503 if none comes free soon: a request that waits for ever is a way to hold a hub up."""
+        try:
+            await asyncio.wait_for(sem.acquire(), timeout=self.s.git_wait)
+        except asyncio.TimeoutError:
+            raise PublishError(503, "Busy", "this hub is busy with git right now; try again in a moment") from None
+        try:
+            yield
+        finally:
+            sem.release()
+
+    def scrub(self, msg: str) -> str:
+        """An error message with this machine's paths taken out: it goes to people who must not learn where the data lives."""
+        for p, name in ((str(self.store.root), "<hub data>"), (str(Path.home()), "~")):
+            msg = msg.replace(p, name)
+        return msg
 
     # ------------------------------------------------------------------ checks
     def _authorised(self, graph: Graph, signer: str, repo: str) -> None:
@@ -222,7 +242,7 @@ class Ingest:
         if not all(gitrepo.valid_ref(r) for r in m.refs):
             raise PublishError(400, "BadManifest", "a branch name is not usable")
         pack = _b64(g.get("pack"), "git.pack")
-        async with self._git_slots:
+        async with self._slot(self._git_slots):
             return await asyncio.to_thread(self._git_check, m, pack)
 
     def _git_check(self, m: Manifest, pack: bytes) -> GitWork:
@@ -245,7 +265,7 @@ class Ingest:
             return GitWork(tmp, pack_sha, len(pack), d)
         except gitrepo.GitError as e:
             shutil.rmtree(tmp, ignore_errors=True)
-            raise PublishError(400, "BadGit", str(e)) from None
+            raise PublishError(400, "BadGit", self.scrub(str(e))) from None
         except BaseException:
             shutil.rmtree(tmp, ignore_errors=True)
             raise
@@ -268,10 +288,13 @@ class Ingest:
         """Last step before the repo shows: check the branches again (another publication may have
         moved one while this one transferred), then keep the objects and move the branches."""
         self._check_ff(work.tmp, m)
+        rewrote = any((cur := self.store.get_ref(m.repo, r)) and cur[0] != m.commit and not gitrepo.is_ancestor(work.tmp, cur[0], m.commit) for r in m.refs)
         perm = self._perm_repo(m.repo)
         gitrepo.adopt(work.tmp, perm, work.pack_sha)
         for ref in m.refs:
             gitrepo.update_ref(perm, ref, m.commit)
+        if rewrote:
+            gitrepo.prune(perm)  # what the old history held is gone from the hub, not only from the branch
 
     def git_source(self, repo: str, host_dir: Path | None = None) -> Path | None:
         """Where the git objects of a served repo are: the hub's own repository for a published one,
@@ -291,7 +314,7 @@ class Ingest:
         heads = set(self.git_refs(repo).values())
         if src is None or not heads:
             raise PublishError(404, "RepoNotFound", f"{repo} has no git history here")
-        async with self._git_slots:
+        async with self._slot(self._read_slots):
             return await asyncio.to_thread(self._pack, src, want, have, heads)
 
     async def smart_http(self, repo: str, body: bytes | None, *, advertise: bool, git_protocol: str | None) -> bytes:
@@ -301,12 +324,13 @@ class Ingest:
         src = self.git_source(repo)
         if src is None or not self.git_refs(repo):
             raise PublishError(404, "RepoNotFound", f"{repo} has no git history here")
-        async with self._git_slots:
+        async with self._slot(self._read_slots):
             try:
                 return await asyncio.to_thread(gitrepo.upload_pack, src, body, advertise=advertise, git_protocol=git_protocol,
                                                fsize=self.s.serve_git_max_pack, timeout=self.s.publish_git_timeout * 4)
             except gitrepo.GitError as e:
-                raise PublishError(500, "GitFailed", str(e)) from None
+                log.warning("git upload-pack failed for %s: %s", repo, e)
+                raise PublishError(500, "GitFailed", "git failed on the hub") from None
 
     def _pack(self, src: Path, want: str, have: list, heads: set) -> bytes:
         try:
@@ -315,7 +339,8 @@ class Ingest:
             known = [h for h in have if gitrepo.run_git(["cat-file", "-e", f"{h}^{{commit}}"], cwd=src, sandbox=True, ok=(0, 1, 128))[0] == 0]
             return gitrepo.make_pack(src, want, known, fsize=self.s.serve_git_max_pack, timeout=self.s.publish_git_timeout * 2, sandbox=True)
         except gitrepo.GitError as e:
-            raise PublishError(500, "GitFailed", str(e)) from None
+            log.warning("git failed serving a pack: %s", e)
+            raise PublishError(500, "GitFailed", "git failed on the hub") from None
 
     def git_refs(self, repo: str) -> dict:
         """Branch -> commit for a git backed repo, from the newest manifest naming each branch."""
@@ -421,7 +446,14 @@ class Ingest:
             job.files.setdefault(x, {"path": "(git history)", "size": size, "state": "waiting", "bytes": 0})["state"] = "pulling"
         if table is not None and m.files_x and not self.store.blob_complete(m.files_x):
             self._put_small(m.files_x, table)
-        task = asyncio.create_task(self._run(job, m, table, need_swarm, have_inline, work))
+        # The torrents join the hub's swarm before the publisher is told to start: it dials straight away, and a peer that
+        # dials a torrent the hub does not know yet is written off by libtorrent for a minute.
+        try:
+            downloads = await self._begin_pull(need_swarm)
+        except BaseException:
+            self.jobs.pop(job.id, None)
+            raise
+        task = asyncio.create_task(self._run(job, m, table, need_swarm, have_inline, work, downloads))
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         self.metrics.inc("thub_publish_total", result="started")
@@ -432,11 +464,13 @@ class Ingest:
     def _put_small(self, x: str, data: bytes) -> None:
         self.store.put_small(x, data)
 
-    async def _run(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict, work: GitWork | None = None) -> None:
+    async def _run(self, job: Job, m: Manifest, table: bytes | None, need: dict, inline: dict, work: GitWork | None = None,
+                   downloads: dict | None = None) -> None:
         try:
-            await asyncio.wait_for(self._pull(job, need), timeout=self.s.publish_timeout)
+            await asyncio.wait_for(self._pull(job, need, downloads if downloads is not None else await self._begin_pull(need)), timeout=self.s.publish_timeout)
             if work is not None and (m.git or {}).get("history"):
-                await asyncio.to_thread(self._check_history, m)
+                async with self._slot(self._git_slots):  # reads the pack into memory: bounded like the other git work
+                    await asyncio.to_thread(self._check_history, m)
             if work is not None:
                 async with self._lock(m.repo):
                     await asyncio.to_thread(self._git_finish, m, work)
@@ -470,7 +504,7 @@ class Ingest:
             self.store.set_blob_state(hx, "missing")
             self.store.blob_path(hx).unlink(missing_ok=True)
             self.store.torrent_path(hx).unlink(missing_ok=True)
-            raise PublishError(400, "BadGit", f"history pack: {e}") from None
+            raise PublishError(400, "BadGit", self.scrub(f"history pack: {e}")) from None
 
     def _fail(self, job: Job, need: dict, why: str) -> None:
         job.state, job.error = "failed", why
@@ -481,17 +515,23 @@ class Ingest:
                 self.store.swarm_torrent_path(x).unlink(missing_ok=True)
         log.warning("publication of %s@%s failed: %s", job.repo, job.commit[:12], why)
 
-    async def _pull(self, job: Job, need: dict) -> None:
-        if not need:
-            return
+    async def _begin_pull(self, need: dict) -> dict:
+        """Add each torrent to the swarm engine, so the hub is ready for the publisher's connection."""
         downloads = {}
         for x, (tbytes, size) in need.items():
             working = self.store.swarm_torrent_path(x)
             working.write_bytes(tbytes)
             dl = await self.swarm.start(working, self.store.blob_path(x).parent)
             if dl is None:
+                for d in downloads.values():
+                    d.cancel()
                 raise PublishError(500, "NoSwarm", "the swarm engine would not start the transfer")
             downloads[x] = dl
+        return downloads
+
+    async def _pull(self, job: Job, need: dict, downloads: dict) -> None:
+        if not need:
+            return
         last_move, seen = time.monotonic(), -1
         pending = set(downloads)
         while pending:

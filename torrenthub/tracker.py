@@ -10,7 +10,7 @@ What it is careful about, because a tracker is a list of addresses that other ma
   * It answers only for torrents this hub holds. It is not an open tracker for anyone's swarm.
   * The address it records is the one the connection came from. A client's `ip=` parameter is ignored,
     so nobody can put someone else's address into the list and send traffic at them.
-  * Entries expire, the number of peers per torrent and of torrents is capped, an announce is limited
+  * Entries expire, the number of peers per torrent, of entries one address may hold for a torrent, and of torrents and entries in all is capped, an announce is limited
     per address (the app's rate limit), and `numwant` has a ceiling.
   * Unspecified and multicast addresses are refused.
 
@@ -35,10 +35,11 @@ EVENTS = {"", "started", "stopped", "completed"}
 
 class Tracker:
     def __init__(self, interval: int = 600, min_interval: int = 60, max_peers: int = 300, max_torrents: int = 100_000,
-                 numwant_max: int = 60, clock=time.time):
+                 numwant_max: int = 60, per_ip: int = 4, max_total: int = 1_000_000, clock=time.time):
         self.interval, self.min_interval = interval, min_interval
         self.ttl = interval * 2 + 60  # a peer that missed two announces is gone
         self.max_peers, self.max_torrents, self.numwant_max = max_peers, max_torrents, numwant_max
+        self.per_ip, self.max_total = per_ip, max_total
         self.clock = clock
         self._t: dict[bytes, dict[tuple[str, int], list]] = {}  # infohash -> (ip, port) -> [last seen, seeding, peer id]
         self._lock = threading.Lock()
@@ -72,7 +73,9 @@ class Tracker:
             key = (str(addr), port)
             if event == "stopped":
                 peers.pop(key, None)
-            elif key in peers or len(peers) < self.max_peers:
+            elif key in peers:
+                peers[key] = [now, left == 0, peer_id[:20]]
+            elif len(peers) < self.max_peers and sum(1 for k in peers if k[0] == key[0]) < self.per_ip and self._total_locked() < self.max_total:
                 peers[key] = [now, left == 0, peer_id[:20]]
             numwant = max(0, min(numwant, self.numwant_max))
             others = [(k, v) for k, v in peers.items() if k != key]
@@ -117,6 +120,9 @@ class Tracker:
             self._expire(self._t[ih], now)
             if not self._t[ih]:
                 del self._t[ih]
+
+    def _total_locked(self) -> int:
+        return sum(len(p) for p in self._t.values())
 
     def stats(self) -> dict:
         with self._lock:

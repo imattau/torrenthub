@@ -217,8 +217,14 @@ class Host:
                 gitrepo.adopt(tmp, perm, sha)
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
+        rewrote = False
         for b in branches:
+            old = gitrepo.run_git(["rev-parse", "-q", "--verify", f"refs/heads/{b}"], cwd=perm, sandbox=True, ok=(0, 1))[1].decode().strip()
+            if old and old != head and gitrepo.run_git(["merge-base", "--is-ancestor", old, head], cwd=perm, sandbox=True, ok=(0, 1, 128))[0] != 0:
+                rewrote = True
             gitrepo.update_ref(perm, b, head)
+        if rewrote:
+            gitrepo.prune(perm)  # a rewrite is meant to take things out: the old objects must go from what is served, not just from the branch
 
     async def _history_entry(self, head: str) -> dict | None:
         """The commit's whole history as a pack, kept as a blob with a torrent and seeded, so a clone fetches it
@@ -332,9 +338,15 @@ class Host:
                 log.exception("host pass failed")
             await asyncio.sleep(self.poll)
 
+    def scrub(self, msg: str) -> str:
+        """An error message without this machine's paths: the status page is public."""
+        for p, name in ((str(self.git_dir), "<repo>"), (str(self.store.root), "<hub data>"), (str(Path.home()), "~")):
+            msg = msg.replace(p, name)
+        return msg
+
     def report(self) -> dict:
-        return {"repo": self.repo, "git": str(self.git_dir),
-                "branches": {b: {"commit": s.commit, "seq": s.seq, "error": s.error, "checked": s.checked} for b, s in self.status.items()}}
+        return {"repo": self.repo,
+                "branches": {b: {"commit": s.commit, "seq": s.seq, "error": self.scrub(s.error), "checked": s.checked} for b, s in self.status.items()}}
 
 
 def build_host_app(settings: Settings, *, swarm=None, **host_kwargs):

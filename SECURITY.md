@@ -3,6 +3,41 @@
 Status: no external audit has been done. This file records what a self-review found and fixed, and
 what is known to be weak. Treat the project as a prototype.
 
+## Third review, 2026-10-16 (H1 to D2: git, the pack and smart HTTP endpoints, LFS, the tracker, the DHT, the helper, the host)
+
+Method: read each new public or hostile-input surface for what an attacker who controls the hub, a publisher, a repository or a
+request could do; wrote the attack as a test; fixed what worked; checked each test fails when its fix is removed
+(`tests/test_review3.py`). Searched for shells, `eval`, unsafe loaders: none outside the pickle scanner. Every git command is built
+from an argument list.
+
+| Finding | Fix |
+|---|---|
+| **A commit rewritten away stayed fetchable by its id.** Git protocol v2 (git's default since 2.26) does not check that a wanted object is reachable, and the hub never deleted objects, so after `git push --force` to remove a leaked file, anyone could still `git fetch origin <old id>`. The same on a host. | After a branch moves to history that does not contain the old head, the hub prunes every unreachable object (`gc --prune=now`) from its repository. A test fetches the old id over protocols 0 and 2 and checks the objects are gone. **What this does not do:** the bytes of a big file the old commit pointed at stay in the blob store until the operator runs `torrenthub block`, old manifests stay as signed history, and anyone who already fetched keeps what they fetched. |
+| **Anonymous readers could starve publishers.** Smart HTTP, the pack endpoint and publishing shared two git slots with no limit on waiting; two slow `upload-pack` requests (up to 4 minutes each) held every publication and pack request behind them. | Readers have their own slots (`THUB_GIT_READ_SLOTS`, 4); a request that cannot get a slot within `THUB_GIT_WAIT` (10 s) is answered 503 `Busy`. Publishing is no longer queued behind readers. |
+| **The history-pack check was not bounded.** It reads a pack of up to 128 MiB into memory and ran in the thread pool with no limit, so a few signers could run many at once. | It takes a publish slot like the rest of the git work. |
+| **Errors named the hub's directories.** Git's complaint (with the repository path) went back to anonymous clients from the smart HTTP and pack endpoints, to publishers from `BadGit`, and to anyone from `/api/thub/host` (which also listed the owner's repository path). | Public git errors say "git failed on the hub" and log the detail; publisher errors have the hub's paths replaced; the host's status page shows no path. |
+| **A hub could put an option on the publisher's git command line.** The commit ids a hub reports for a repo went into `git cat-file -e` unchecked. | A value from a hub is used only if it is 40 hex characters (`hub_heads`, `local_has`). |
+| **One address could fill a torrent's peer list in the tracker**, and nothing bounded the tracker in all. | At most 4 entries per address per torrent (`THUB_TRACKER_PER_IP`) and 1,000,000 entries in all (`THUB_TRACKER_MAX_TOTAL`). |
+| **The LFS endpoint echoed what it was sent** (a client's `size` of any JSON type, up to the body limit). | Only a non-negative integer is sent back. |
+| **A hub could make a client announce to an address on the client's own network.** The trackers named in a hub's torrent were used as given. | A tracker on a private, loopback or link-local address is used only if it is the hub's own address or the hub is itself on a private network (`tracker_ok`). Names are not resolved, so a name that resolves to a private address still gets through. |
+| **A pointer can claim any size.** A cloned repository could say its big file is a petabyte and the client would start. | A download is refused before it starts if it cannot fit in the free space. |
+| **Checked-out big files were hard links into the cache.** Editing the file in place changed the cache object that `torrenthub seed` shares. | `pull-files` copies; `seed` hashes each file and skips (with a warning) any that no longer matches its name. |
+| **A race in publishing (found while testing the bound above, older than this review).** The hub answered a publication before it added the torrents to its swarm; the publisher dials at once; a dial to an unknown torrent fails and libtorrent will not retry that peer for a minute. Four publishers at once lost one every time (reproduced on the previous commit). | The torrents join the swarm before the answer, and libtorrent's retry wait is 5 s instead of 60. |
+
+After the fixes, the full publish, clone, seed, clone-by-tracker run was repeated on the three machines with the final code: push 7.0 s, client A 7.1 s, client B (tracker only, hub peer off, web seed off) 4.8 s, nothing on the hub's HTTP counters. All three are faster than before the race fix (10.6 to 12.8 s, 10.6 s and 7.6 s).
+
+Suspected and shown not to be a problem: a hostile pack cannot make the hub write outside its directories (the pack is indexed in a
+throwaway repository, and only the pack and its index are copied, under names the hub builds from a hash it computed); the `ref` in a
+manifest cannot be a path (`valid_ref`); a hub-supplied error cannot add a protocol line to the git helper (whitespace is collapsed);
+the object cap, pack cap and time limit bound `index-pack`.
+
+Known and not fixed:
+- Names in a hub's torrent that resolve to a private address are not filtered by the client.
+- Unicode-equivalent file names (NFC against NFD) are not treated as colliding; only case is.
+- The tracker and the DHT tell the hub, and anyone running a public DHT node, which addresses ask for which infohashes.
+- The client runs `git index-pack` on a hub's pack in the user's own repository, with the user's own git configuration. It is git's parser against hostile input, unreviewed.
+- A tracker cannot tell an honest address from a lying one; anyone can announce from an address they control.
+
 ## Fixed in the 2026-10-16 review
 
 | Finding | Fix |
@@ -60,4 +95,6 @@ Versions are now bounded in `pyproject.toml` (a tested floor and the next major 
 
 ## Not reviewed
 
-TLS and certificate handling (the project relies on httpx and uvicorn defaults), the MCP server's tool surface beyond what its tests cover, the libtorrent engine itself, and the container and VM images used for testing.
+TLS and certificate handling (the project relies on httpx and uvicorn defaults; every test and VM run used plain HTTP), the MCP server's tool surface beyond what its tests cover, the libtorrent engine and its DHT against hostile peers, git itself (`index-pack`, `upload-pack`, `pack-objects` and `gc` running on hostile input, as C code we did not read), the container and VM images used for testing, behaviour under real load (every limit was tested for being enforced, none for being the right number), and anything on Windows or macOS.
+
+**All three reviews were done by the same author who wrote the code, by reading it and by writing attacks as tests. That finds the mistakes that author can see. It is not an independent audit, and it should not be taken for one.**

@@ -321,6 +321,14 @@ def upload_pack(repo: Path, body: bytes | None, *, advertise: bool, git_protocol
     return out
 
 
+def prune(repo: Path) -> None:
+    """Delete every object no branch reaches. After a branch is moved to history that does not contain the old head
+    (a rewrite, to take something out), the old objects would otherwise stay on disk and, over git protocol v2, stay
+    fetchable by their id: v2 does not check that a wanted object is reachable."""
+    run_git(["reflog", "expire", "--expire=now", "--all"], cwd=repo, sandbox=True)
+    run_git(["gc", "--prune=now", "--quiet"], cwd=repo, sandbox=True, timeout=300.0)
+
+
 # ------------------------------------------------------------------ the publisher's side
 
 def local_commit(repo: Path, rev: str) -> str:
@@ -332,6 +340,8 @@ def local_commit(repo: Path, rev: str) -> str:
 
 
 def local_has(repo: Path, sha: str) -> bool:
+    if not (isinstance(sha, str) and SHA40.fullmatch(sha)):  # a value from a hub is never put on a command line unchecked
+        return False
     rc, _, _ = run_git(["-C", str(repo), "cat-file", "-e", f"{sha}^{{commit}}"], ok=(0, 1, 128))
     return rc == 0
 

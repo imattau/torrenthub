@@ -153,6 +153,10 @@ class Settings:
     tracker_interval: int = 600
     tracker_max_peers: int = 300
     tracker_per_ip_per_minute: float = 120.0
+    git_read_slots: int = 4  # git processes serving anonymous readers at once; publishers have their own
+    git_wait: float = 10.0  # seconds a request waits for a free slot before the hub says it is busy
+    tracker_per_ip: int = 4  # entries one address may hold for one torrent
+    tracker_max_total: int = 1_000_000
     git_pack_per_ip_per_minute: float = 30.0  # pack requests per address
     git_http_per_ip_per_minute: float = 120.0  # smart HTTP and LFS requests per address
     git_http_max_body: int = 4 * 1024 * 1024  # largest git-upload-pack request body
@@ -246,6 +250,10 @@ class Settings:
             tracker_interval=int(e("THUB_TRACKER_INTERVAL", "600")),
             tracker_max_peers=int(e("THUB_TRACKER_MAX_PEERS", "300")),
             tracker_per_ip_per_minute=float(e("THUB_TRACKER_PER_IP_MINUTE", "120")),
+            git_read_slots=int(e("THUB_GIT_READ_SLOTS", "4")),
+            git_wait=float(e("THUB_GIT_WAIT", "10")),
+            tracker_per_ip=int(e("THUB_TRACKER_PER_IP", "4")),
+            tracker_max_total=int(e("THUB_TRACKER_MAX_TOTAL", "1000000")),
             git_pack_per_ip_per_minute=float(e("THUB_GIT_PACK_PER_IP_MINUTE", "30")),
             serve_git_max_pack=parse_size(e("THUB_SERVE_GIT_MAX_PACK"), 256 * 1024 * 1024),
             publish_timeout=float(e("THUB_PUBLISH_TIMEOUT", "3600")),

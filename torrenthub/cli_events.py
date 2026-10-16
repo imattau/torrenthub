@@ -467,6 +467,9 @@ def run_event_command(args, settings, p) -> None:
                 for sub_dir in ("objects", "packs"):
                     f = gd / "thub" / sub_dir / tp.stem
                     if f.is_file():
+                        if clientswarm._hash(f)[0] != f.name:  # seeding skips libtorrent's own check, so check here: a changed file is not shared
+                            print(f"not seeding {f.name[:12]}: the file has changed since it was fetched", file=sys.stderr)
+                            continue
                         items.append((tp, f))
             cfg = clientswarm.config_from_env(gd)
 

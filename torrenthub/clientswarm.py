@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -134,6 +135,9 @@ def fetch_blob(hub: str, key: str, size: int, dest: Path, work: Path, *, infohas
     hub = hub.rstrip("/")
     work = Path(work)
     work.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(work).free
+    if size > free:  # a pointer's size is whatever its author wrote; do not start what cannot finish
+        raise GitError(f"{key[:12]} is {size:,} bytes and only {free:,} are free where it would be kept")
     if cfg.enabled:
         try:
             got = asyncio.run(_via_swarm(hub, key, size, dest, work, infohash, cfg, keep_torrent, say))
@@ -158,7 +162,7 @@ async def _via_swarm(hub, key, size, dest, work, infohash, cfg, keep_torrent, sa
     validate_torrent(raw, key, size)
     if infohash and infohash_from_torrent(raw) != infohash:
         raise TorrentRejected("the torrent is not the one the signed manifest names")
-    trackers = list(dict.fromkeys([*cfg.trackers, *_trackers_of(raw)]))
+    trackers = usable_trackers(raw, hub, cfg)
     peers = list(cfg.peers)
     port = (info.get("swarm") or {}).get("port")
     host = urlsplit(hub).hostname
@@ -216,6 +220,35 @@ def swarm_for(cfg: SwarmConfig, info: dict | None = None, peers: list | None = N
         nodes.append((d["host"], int(d["port"])))
     return LibtorrentSwarm(cfg.listen_port, cfg.listen_host, extra_peers=list(cfg.peers) if peers is None else peers, dht=cfg.dht, dht_nodes=nodes if cfg.dht else [], dht_public=cfg.dht_public,
                            dht_local=cfg.dht_local, upnp=cfg.upnp, lsd=cfg.lsd)
+
+
+def usable_trackers(raw: bytes, hub: str, cfg: SwarmConfig) -> list[str]:
+    """The trackers to announce to: the ones the user configured, then those in the hub's torrent that are safe to use."""
+    return list(dict.fromkeys([*cfg.trackers, *(u for u in _trackers_of(raw) if tracker_ok(u, urlsplit(hub).hostname))]))
+
+
+def tracker_ok(url: str, hub_host: str | None) -> bool:
+    """May a client announce to a tracker named in a hub's torrent? A hub chooses what its torrents say, and an announce is a
+    request the client's machine sends: a tracker at 169.254.169.254, or at some address on the client's own network, would
+    make it send that request there. So a tracker on a private, loopback or link-local address is used only if it is the hub's
+    own address, or the hub itself is on such a network. Names are not resolved here."""
+    import ipaddress
+
+    host = urlsplit(url).hostname
+    if not host:
+        return False
+    if host == hub_host:
+        return True
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True
+    if ip.is_global:
+        return True
+    try:
+        return not ipaddress.ip_address(hub_host or "").is_global
+    except ValueError:
+        return False
 
 
 def _trackers_of(raw: bytes) -> list[str]:

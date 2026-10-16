@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import shutil
 import subprocess
 import uuid
 from pathlib import Path
@@ -191,10 +192,7 @@ def materialize(repo_dir: Path, hubs: list[str] | None = None) -> list[str]:
         src = ensure_cached(gd, oid, size, hubs)
         tmp = p.with_name(p.name + ".thub-tmp")
         try:
-            try:
-                os.link(src, tmp)
-            except OSError:
-                tmp.write_bytes(src.read_bytes())
+            shutil.copyfile(src, tmp)  # a copy, not a link: editing the checked-out file must not change the cache that is seeded to others
             os.replace(tmp, p)
         finally:
             tmp.unlink(missing_ok=True)
