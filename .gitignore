@@ -6,3 +6,6 @@ __pycache__/
 /data/
 dist/
 build/
+
+# local secrets
+.nostr-publisher.local
