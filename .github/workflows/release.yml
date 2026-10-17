@@ -286,7 +286,9 @@ jobs:
           VERSION: ${{ needs.version.outputs.version }}
         run: |
           npack install "npk/torrenthub-${VERSION}-linux-x86_64.npk" --store "$RUNNER_TEMP/store"
-          find "$RUNNER_TEMP/store" -name torrenthub -type f -perm -u+x | head -1 | xargs -I{} {} --version
+          exe=$(find "$RUNNER_TEMP/store" -name torrenthub -perm -u+x \( -type f -o -type l \) | head -1)
+          test -n "$exe" || { find "$RUNNER_TEMP/store"; exit 1; }
+          "$exe" --version
       - uses: actions/upload-artifact@v4
         with:
           name: npk
