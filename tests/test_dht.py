@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import time
 
 import httpx
@@ -164,6 +165,7 @@ def test_a_session_asked_for_any_port_is_given_a_concrete_one():
     assert all(0 < p < 65536 for p in ports)
 
 
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="listing the machine's addresses is Linux only; elsewhere the wildcard address is used as before")
 def test_a_wildcard_listen_address_becomes_the_machines_addresses_when_the_dht_is_on():
     """The DHT answers nobody when the session listens on 0.0.0.0 on a machine with several interfaces; listing the addresses fixes it."""
     from torrenthub.swarm import local_ipv4_addresses

@@ -11,6 +11,7 @@ import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 from collections import OrderedDict
 
@@ -262,7 +263,8 @@ def signer_process(tmp_path):
     """A signer serving on a Unix socket, in a thread of its own event loop."""
     root = tmp_path / "dl"
     root.mkdir()
-    sock = str(tmp_path / "s.sock")
+    sockdir = tempfile.mkdtemp(prefix="ts", dir="/tmp" if os.path.isdir("/tmp") else None)  # short: macOS allows 104 bytes in a socket path and pytest's tmp_path is longer
+    sock = os.path.join(sockdir, "s.sock")
     s = Signer(key(8), SignerConfig(root, tmp_path / "audit.jsonl"))
     loop = asyncio.new_event_loop()
     ready = threading.Event()
@@ -343,3 +345,10 @@ def test_mcp_attest_file_says_plainly_when_a_check_failed(world, signer_process)
     assert d["summary"].startswith("CHECK FAILED, do not load this file") and "posix.system" in d["summary"]
     assert all(a["gateway"] == "accepted" for a in d["attestations"]), "stored fine, which is not the same as safe"
     assert "does not prove a file safe" in instructions and "get_verdict" in instructions
+
+
+def test_a_socket_path_that_is_too_long_is_refused_with_a_message_not_a_bare_oserror(tmp_path):
+    long = str(tmp_path / ("d" * 120) / "s.sock")
+    s = Signer(key(8), SignerConfig(tmp_path / "dl", tmp_path / "audit.jsonl"))
+    with pytest.raises(ValueError, match="use a shorter path"):
+        asyncio.run(serve(s, long))

@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import socket
+import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -168,7 +169,14 @@ class Refused(Exception):
 
 # --------------------------------------------------------------------- server
 
+# The most a Unix socket path can hold: 108 bytes on Linux, 104 on macOS and the BSDs (one of them is the final NUL).
+MAX_SOCKET_PATH = 103 if sys.platform != "linux" else 107
+
+
 async def serve(signer: Signer, socket_path: str):
+    if len(os.fsencode(socket_path)) > MAX_SOCKET_PATH:
+        raise ValueError(f"the socket path is {len(os.fsencode(socket_path))} bytes and this system allows {MAX_SOCKET_PATH}: "
+                         f"use a shorter path, such as /tmp/thub-signer.sock or one under $XDG_RUNTIME_DIR")
     path = Path(socket_path)
     if path.exists():
         path.unlink()
