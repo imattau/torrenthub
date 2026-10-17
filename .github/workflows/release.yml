@@ -3,6 +3,7 @@
 #
 #   artifacts:  wheel + sdist | standalone builds for Linux x86-64/arm64, Windows x86-64, macOS arm64/x86-64 |
 #               .deb and .rpm for x86-64 and arm64 | a container image (pushed to ghcr.io on a tag)
+#   npack:      the Linux builds are also packed as .npk (github.com/imattau/npack); published to Nostr only if PUBLISH_NPACK is "true".
 #   publishing: a tag v<version> (which must match pyproject.toml) creates the release. PyPI is published only if the
 #               repository variable PUBLISH_PYPI is "true" and PyPI trusted publishing has been set up for this repo.
 #
@@ -241,10 +242,60 @@ jobs:
             org.opencontainers.image.licenses=MIT
             org.opencontainers.image.version=${{ needs.version.outputs.version }}
 
+  npk:
+    # The same Linux builds as an npack package (https://github.com/imattau/npack): a deterministic .npk plus its manifest.
+    needs: [version, binary]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binary-linux-*
+          merge-multiple: true
+          path: bins
+      - name: Get the npack CLI (latest release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download --repo imattau/npack --pattern 'npack_*_amd64.deb' --dir npack-deb
+          dpkg-deb -x npack-deb/*.deb npack-root
+          sudo install -m 0755 npack-root/usr/bin/npack /usr/local/bin/npack
+          npack --version
+      - name: Pack and verify one .npk per architecture
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          PUBLISHER: ${{ github.ref_type == 'tag' && vars.NOSTR_PUBLISHER || 'manual-test-publisher' }}
+        run: |
+          [ "${GITHUB_REF_TYPE}" != tag ] || test -n "$PUBLISHER" || { echo "::error::set the repository variable NOSTR_PUBLISHER"; exit 1; }
+          mkdir -p npk
+          for arch in x86_64 arm64; do
+            npk_arch=$arch; [ $arch = arm64 ] && npk_arch=aarch64
+            root=pkg-$arch; rm -rf "$root"; mkdir -p "$root/.npack" "$root/bin" "$root/share"
+            tar -xzf "bins/torrenthub-${VERSION}-linux-${arch}.tar.gz" -C "$root/share"
+            for exe in torrenthub git-remote-thub; do ln -s "../share/torrenthub/$exe" "$root/bin/$exe"; done
+            artifact="torrenthub-${VERSION}-linux-${npk_arch}.npk"
+            jq -n --arg publisher "$PUBLISHER" --arg version "$VERSION" --arg artifact "$artifact" --arg arch "$npk_arch" \
+              '{publisher:$publisher,name:"torrenthub",version:$version,artifact:$artifact,sha256:"",dependencies:[],conflicts:[],os:"linux",arch:$arch,format:"npk",runtime_requires:[],provides:[]}' \
+              > "$root/.npack/manifest.json"
+            npack pack "$root" --output "npk/$artifact"
+            npack manifest "npk/$artifact" --output "npk/torrenthub-${VERSION}-linux-${npk_arch}.manifest.json"
+            npack verify "npk/torrenthub-${VERSION}-linux-${npk_arch}.manifest.json"
+          done
+          ls -la npk
+      - name: Install the x86-64 package into a scratch store and run it
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          npack install "npk/torrenthub-${VERSION}-linux-x86_64.npk" --store "$RUNNER_TEMP/store"
+          find "$RUNNER_TEMP/store" -name torrenthub -type f -perm -u+x | head -1 | xargs -I{} {} --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npk
+          path: npk/*
+
   release:
     # Only for a version tag, and only after everything above passed.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [version, dist, binary, linux-packages, test-packages, test-service, container]
+    needs: [version, dist, binary, npk, linux-packages, test-packages, test-service, container]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -260,7 +311,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release create "${GITHUB_REF_NAME}" artifacts/* --repo "${GITHUB_REPOSITORY}" --title "torrenthub ${GITHUB_REF_NAME#v}" \
-            --notes "Standalone builds (Linux, Windows, macOS), .deb and .rpm packages, a wheel and an sdist. Builds are not code-signed: see DEPLOY.md. Verify downloads against SHA256SUMS."
+            --notes "Standalone builds (Linux, Windows, macOS), .deb and .rpm packages, a wheel and an sdist, and npack .npk packages with their manifests. Builds are not code-signed: see DEPLOY.md. Verify downloads against SHA256SUMS."
 
   pypi:
     if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_PYPI == 'true'
@@ -275,3 +326,40 @@ jobs:
           name: dist
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  nostr:
+    # Publishes the .npk packages to Nostr relays and Blossom servers, signed by the publisher key. Off unless the
+    # repository variable PUBLISH_NPACK is "true"; needs NOSTR_PUBLISHER, NOSTR_RELAYS and NOSTR_BLOSSOM_SERVERS (one URL per
+    # line) as variables and NOSTR_SECRET_KEY as a secret of the protected "release" environment.
+    if: startsWith(github.ref, 'refs/tags/v') && vars.PUBLISH_NPACK == 'true'
+    needs: [npk, release]
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: npk
+          path: npk
+      - name: Get the npack CLI (latest release)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download --repo imattau/npack --pattern 'npack_*_amd64.deb' --dir npack-deb
+          dpkg-deb -x npack-deb/*.deb npack-root
+          sudo install -m 0755 npack-root/usr/bin/npack /usr/local/bin/npack
+      - name: Publish artifacts and release events
+        env:
+          NOSTR_SECRET_KEY: ${{ secrets.NOSTR_SECRET_KEY }}
+          NOSTR_RELAYS: ${{ vars.NOSTR_RELAYS }}
+          NOSTR_BLOSSOM_SERVERS: ${{ vars.NOSTR_BLOSSOM_SERVERS }}
+        run: |
+          test -n "$NOSTR_SECRET_KEY" || { echo "::error::the release environment must define NOSTR_SECRET_KEY"; exit 1; }
+          args=()
+          while IFS= read -r r; do [[ -n "${r//[[:space:]]/}" ]] && args+=(--relay "$r"); done <<< "$NOSTR_RELAYS"
+          while IFS= read -r s; do [[ -n "${s//[[:space:]]/}" ]] && args+=(--server "$s"); done <<< "$NOSTR_BLOSSOM_SERVERS"
+          [[ " ${args[*]} " == *" --relay "* && " ${args[*]} " == *" --server "* ]] || { echo "::error::define NOSTR_RELAYS and NOSTR_BLOSSOM_SERVERS"; exit 1; }
+          for m in npk/*.manifest.json; do
+            npack publish "$m" --secret-key "$NOSTR_SECRET_KEY" "${args[@]}"
+          done
