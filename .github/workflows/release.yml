@@ -302,8 +302,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Named patterns, not everything: the container build also uploads a build-record artifact, which can be corrupt.
       - uses: actions/download-artifact@v4
         with:
+          pattern: "{dist,npk,linux-packages,binary-*}"
           path: artifacts
           merge-multiple: true
       - name: Checksums
